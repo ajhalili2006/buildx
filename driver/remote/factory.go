@@ -4,17 +4,18 @@ import (
 	"context"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
-
-	// import connhelpers for special url schemes
-	_ "github.com/moby/buildkit/client/connhelper/dockercontainer"
-	_ "github.com/moby/buildkit/client/connhelper/kubepod"
-	_ "github.com/moby/buildkit/client/connhelper/ssh"
 
 	"github.com/docker/buildx/driver"
 	util "github.com/docker/buildx/driver/remote/util"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/pkg/errors"
+
+	// import connhelpers for special url schemes
+	_ "github.com/moby/buildkit/client/connhelper/dockercontainer"
+	_ "github.com/moby/buildkit/client/connhelper/kubepod"
+	_ "github.com/moby/buildkit/client/connhelper/ssh"
 )
 
 const prioritySupported = 20
@@ -35,7 +36,7 @@ func (*factory) Usage() string {
 	return "remote"
 }
 
-func (*factory) Priority(ctx context.Context, endpoint string, api dockerclient.APIClient) int {
+func (*factory) Priority(ctx context.Context, endpoint string, api dockerclient.APIClient, dialMeta map[string][]string) int {
 	if util.IsValidEndpoint(endpoint) != nil {
 		return priorityUnsupported
 	}
@@ -46,7 +47,7 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 	if len(cfg.Files) > 0 {
 		return nil, errors.Errorf("setting config file is not supported for remote driver")
 	}
-	if len(cfg.BuildkitFlags) > 0 {
+	if len(cfg.BuildkitdFlags) > 0 {
 		return nil, errors.Errorf("setting buildkit flags is not supported for remote driver")
 	}
 
@@ -80,6 +81,12 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 			}
 			tls.key = v
 			tlsEnabled = true
+		case "default-load":
+			parsed, err := strconv.ParseBool(v)
+			if err != nil {
+				return nil, err
+			}
+			d.defaultLoad = parsed
 		default:
 			return nil, errors.Errorf("invalid driver option %s for remote driver", k)
 		}
@@ -98,11 +105,11 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 		if tls.caCert == "" {
 			missing = append(missing, "cacert")
 		}
-		if tls.cert == "" {
-			missing = append(missing, "cert")
-		}
-		if tls.key == "" {
+		if tls.cert != "" && tls.key == "" {
 			missing = append(missing, "key")
+		}
+		if tls.key != "" && tls.cert == "" {
+			missing = append(missing, "cert")
 		}
 		if len(missing) > 0 {
 			return nil, errors.Errorf("tls enabled, but missing keys %s", strings.Join(missing, ", "))

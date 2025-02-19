@@ -7,12 +7,15 @@ import (
 
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/docker/client"
+	dockerclient "github.com/docker/docker/client"
 )
 
 // Client represents an active docker object.
 type Client struct {
 	cli command.Cli
+
+	featuresOnce  sync.Once
+	featuresCache map[Feature]bool
 }
 
 // NewClient initializes a new docker client.
@@ -21,7 +24,7 @@ func NewClient(cli command.Cli) *Client {
 }
 
 // API returns a new docker API client.
-func (c *Client) API(name string) (client.APIClient, error) {
+func (c *Client) API(name string) (dockerclient.APIClient, error) {
 	if name == "" {
 		name = c.cli.CurrentContext()
 	}
@@ -38,39 +41,69 @@ func (c *Client) LoadImage(ctx context.Context, name string, status progress.Wri
 	pr, pw := io.Pipe()
 	done := make(chan struct{})
 
-	ctx, cancel := context.WithCancel(ctx)
 	var w *waitingWriter
 	w = &waitingWriter{
 		PipeWriter: pw,
 		f: func() {
-			resp, err := dapi.ImageLoad(ctx, pr, false)
-			defer close(done)
-			if err != nil {
+			handleErr := func(err error) {
 				pr.CloseWithError(err)
 				w.mu.Lock()
 				w.err = err
 				w.mu.Unlock()
+			}
+
+			resp, err := dapi.ImageLoad(ctx, pr)
+			defer close(done)
+			if err != nil {
+				handleErr(err)
 				return
 			}
-			prog := progress.WithPrefix(status, "", false)
-			progress.FromReader(prog, "importing to docker", resp.Body)
+
+			status = progress.ResetTime(status)
+			if err := progress.Wrap("importing to docker", status.Write, func(l progress.SubLogger) error {
+				return fromReader(l, resp.Body)
+			}); err != nil {
+				handleErr(err)
+			}
 		},
-		done:   done,
-		cancel: cancel,
+		done: done,
 	}
 	return w, func() {
 		pr.Close()
 	}, nil
 }
 
+func (c *Client) Features(ctx context.Context, name string) map[Feature]bool {
+	c.featuresOnce.Do(func() {
+		c.featuresCache = c.features(ctx, name)
+	})
+	return c.featuresCache
+}
+
+func (c *Client) features(ctx context.Context, name string) map[Feature]bool {
+	features := make(map[Feature]bool)
+	if dapi, err := c.API(name); err == nil {
+		if info, err := dapi.Info(ctx); err == nil {
+			for _, v := range info.DriverStatus {
+				switch v[0] {
+				case "driver-type":
+					if v[1] == "io.containerd.snapshotter.v1" {
+						features[OCIImporter] = true
+					}
+				}
+			}
+		}
+	}
+	return features
+}
+
 type waitingWriter struct {
 	*io.PipeWriter
-	f      func()
-	once   sync.Once
-	mu     sync.Mutex
-	err    error
-	done   chan struct{}
-	cancel func()
+	f    func()
+	once sync.Once
+	mu   sync.Mutex
+	err  error
+	done chan struct{}
 }
 
 func (w *waitingWriter) Write(dt []byte) (int, error) {

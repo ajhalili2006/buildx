@@ -3,10 +3,13 @@ package gitutil
 import (
 	"bytes"
 	"context"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
+	"github.com/docker/buildx/util/osutil"
 	"github.com/pkg/errors"
 )
 
@@ -47,7 +50,7 @@ func New(opts ...Option) (*Git, error) {
 
 	c.gitpath, err = gitPath(c.wd)
 	if err != nil {
-		return nil, errors.New("git not found in PATH")
+		return nil, err
 	}
 
 	return c, nil
@@ -64,17 +67,35 @@ func (c *Git) IsDirty() bool {
 }
 
 func (c *Git) RootDir() (string, error) {
-	return c.clean(c.run("rev-parse", "--show-toplevel"))
+	root, err := c.clean(c.run("rev-parse", "--show-toplevel"))
+	if err != nil {
+		return "", err
+	}
+	return osutil.SanitizePath(root), nil
+}
+
+func (c *Git) GitDir() (string, error) {
+	dir, err := c.RootDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, ".git"), nil
 }
 
 func (c *Git) RemoteURL() (string, error) {
-	// Try to get the remote URL from the origin remote first
+	// Try default remote based on remote tracking branch
+	if remote, err := c.currentRemote(); err == nil && remote != "" {
+		if ru, err := c.clean(c.run("remote", "get-url", remote)); err == nil && ru != "" {
+			return stripCredentials(ru), nil
+		}
+	}
+	// Next try to get the remote URL from the origin remote first
 	if ru, err := c.clean(c.run("remote", "get-url", "origin")); err == nil && ru != "" {
-		return ru, nil
+		return stripCredentials(ru), nil
 	}
 	// If that fails, try to get the remote URL from the upstream remote
 	if ru, err := c.clean(c.run("remote", "get-url", "upstream")); err == nil && ru != "" {
-		return ru, nil
+		return stripCredentials(ru), nil
 	}
 	return "", errors.New("no remote URL found for either origin or upstream")
 }
@@ -139,6 +160,22 @@ func (c *Git) clean(out string, err error) (string, error) {
 	return out, err
 }
 
+func (c *Git) currentRemote() (string, error) {
+	symref, err := c.clean(c.run("symbolic-ref", "-q", "HEAD"))
+	if err != nil {
+		return "", err
+	}
+	if symref == "" {
+		return "", nil
+	}
+	// git for-each-ref --format='%(upstream:remotename)'
+	remote, err := c.clean(c.run("for-each-ref", "--format=%(upstream:remotename)", symref))
+	if err != nil {
+		return "", err
+	}
+	return remote, nil
+}
+
 func IsUnknownRevision(err error) bool {
 	if err == nil {
 		return false
@@ -146,4 +183,17 @@ func IsUnknownRevision(err error) bool {
 	// https://github.com/git/git/blob/a6a323b31e2bcbac2518bddec71ea7ad558870eb/setup.c#L204
 	errMsg := strings.ToLower(err.Error())
 	return strings.Contains(errMsg, "unknown revision or path not in the working tree") || strings.Contains(errMsg, "bad revision")
+}
+
+// stripCredentials takes a URL and strips username and password from it.
+// e.g. "https://user:password@host.tld/path.git" will be changed to
+// "https://host.tld/path.git".
+// TODO: remove this function once fix from BuildKit is vendored here
+func stripCredentials(s string) string {
+	ru, err := url.Parse(s)
+	if err != nil {
+		return s // string is not a URL, just return it
+	}
+	ru.User = nil
+	return ru.String()
 }

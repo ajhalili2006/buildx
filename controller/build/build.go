@@ -1,14 +1,8 @@
 package build
 
 import (
-	"bytes"
 	"context"
-	"encoding/base64"
-	"encoding/csv"
-	"encoding/json"
-	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,161 +18,155 @@ import (
 	"github.com/docker/buildx/util/platformutil"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/cli/cli/config"
 	dockeropts "github.com/docker/cli/opts"
-	"github.com/docker/distribution/reference"
-	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/go-units"
+	"github.com/docker/docker/api/types/container"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/session/auth/authprovider"
-	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/util/grpcerrors"
-	"github.com/moby/buildkit/util/progress/progressui"
-	"github.com/morikuni/aec"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 )
 
 const defaultTargetName = "default"
 
-func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.BuildOptions, inStream io.Reader, progressMode string, statusChan chan *client.SolveStatus) (res *build.ResultContext, err error) {
-	if in.Opts.NoCache && len(in.NoCacheFilter) > 0 {
-		return nil, errors.Errorf("--no-cache and --no-cache-filter cannot currently be used together")
+// RunBuild runs the specified build and returns the result.
+//
+// NOTE: When an error happens during the build and this function acquires the debuggable *build.ResultHandle,
+// this function returns it in addition to the error (i.e. it does "return nil, res, err"). The caller can
+// inspect the result and debug the cause of that error.
+func RunBuild(ctx context.Context, dockerCli command.Cli, in *controllerapi.BuildOptions, inStream io.Reader, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, *build.Inputs, error) {
+	if in.NoCache && len(in.NoCacheFilter) > 0 {
+		return nil, nil, nil, errors.Errorf("--no-cache and --no-cache-filter cannot currently be used together")
 	}
 
-	if in.Quiet && progressMode != progress.PrinterModeAuto && progressMode != progress.PrinterModeQuiet {
-		return nil, errors.Errorf("progress=%s and quiet cannot be used together", progressMode)
-	} else if in.Quiet {
-		progressMode = "quiet"
-	}
-
-	contexts, err := parseContextNames(in.Contexts)
-	if err != nil {
-		return nil, err
-	}
-
-	printFunc, err := parsePrintFunc(in.PrintFunc)
-	if err != nil {
-		return nil, err
+	contexts := map[string]build.NamedContext{}
+	for name, path := range in.NamedContexts {
+		contexts[name] = build.NamedContext{Path: path}
 	}
 
 	opts := build.Options{
 		Inputs: build.Inputs{
 			ContextPath:    in.ContextPath,
 			DockerfilePath: in.DockerfileName,
-			InStream:       inStream,
+			InStream:       build.NewSyncMultiReader(inStream),
 			NamedContexts:  contexts,
 		},
-		BuildArgs:     listToMap(in.BuildArgs, true),
-		ExtraHosts:    in.ExtraHosts,
-		ImageIDFile:   in.ImageIDFile,
-		Labels:        listToMap(in.Labels, false),
-		NetworkMode:   in.NetworkMode,
-		NoCache:       in.Opts.NoCache,
-		NoCacheFilter: in.NoCacheFilter,
-		Pull:          in.Opts.Pull,
-		ShmSize:       dockeropts.MemBytes(in.ShmSize),
-		Tags:          in.Tags,
-		Target:        in.Target,
-		Ulimits:       controllerUlimitOpt2DockerUlimit(in.Ulimits),
-		PrintFunc:     printFunc,
+		Ref:                    in.Ref,
+		BuildArgs:              in.BuildArgs,
+		CgroupParent:           in.CgroupParent,
+		ExtraHosts:             in.ExtraHosts,
+		Labels:                 in.Labels,
+		NetworkMode:            in.NetworkMode,
+		NoCache:                in.NoCache,
+		NoCacheFilter:          in.NoCacheFilter,
+		Pull:                   in.Pull,
+		ShmSize:                dockeropts.MemBytes(in.ShmSize),
+		Tags:                   in.Tags,
+		Target:                 in.Target,
+		Ulimits:                controllerUlimitOpt2DockerUlimit(in.Ulimits),
+		GroupRef:               in.GroupRef,
+		ProvenanceResponseMode: confutil.ParseMetadataProvenance(in.ProvenanceResponseMode),
 	}
 
 	platforms, err := platformutil.Parse(in.Platforms)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	opts.Platforms = platforms
 
-	dockerConfig := config.LoadDefaultConfigFile(os.Stderr)
-	opts.Session = append(opts.Session, authprovider.NewDockerAuthProvider(dockerConfig))
+	dockerConfig := dockerCli.ConfigFile()
+	opts.Session = append(opts.Session, authprovider.NewDockerAuthProvider(authprovider.DockerAuthProviderConfig{
+		ConfigFile: dockerConfig,
+	}))
 
-	secrets, err := buildflags.ParseSecretSpecs(in.Secrets)
+	secrets, err := controllerapi.CreateSecrets(in.Secrets)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	opts.Session = append(opts.Session, secrets)
 
 	sshSpecs := in.SSH
 	if len(sshSpecs) == 0 && buildflags.IsGitSSH(in.ContextPath) {
-		sshSpecs = []string{"default"}
+		sshSpecs = append(sshSpecs, &controllerapi.SSH{ID: "default"})
 	}
-	ssh, err := buildflags.ParseSSHSpecs(sshSpecs)
+	ssh, err := controllerapi.CreateSSH(sshSpecs)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	opts.Session = append(opts.Session, ssh)
 
-	outputs, err := buildflags.ParseOutputs(in.Outputs)
+	outputs, _, err := controllerapi.CreateExports(in.Exports)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-	if in.Opts.ExportPush {
-		if in.Opts.ExportLoad {
-			return nil, errors.Errorf("push and load may not be set together at the moment")
+	if in.ExportPush {
+		var pushUsed bool
+		for i := range outputs {
+			if outputs[i].Type == client.ExporterImage {
+				outputs[i].Attrs["push"] = "true"
+				pushUsed = true
+			}
 		}
-		if len(outputs) == 0 {
-			outputs = []client.ExportEntry{{
-				Type: "image",
+		if !pushUsed {
+			outputs = append(outputs, client.ExportEntry{
+				Type: client.ExporterImage,
 				Attrs: map[string]string{
 					"push": "true",
 				},
-			}}
-		} else {
-			switch outputs[0].Type {
-			case "image":
-				outputs[0].Attrs["push"] = "true"
-			default:
-				return nil, errors.Errorf("push and %q output can't be used together", outputs[0].Type)
-			}
+			})
 		}
 	}
-	if in.Opts.ExportLoad {
-		if len(outputs) == 0 {
-			outputs = []client.ExportEntry{{
-				Type:  "docker",
+	if in.ExportLoad {
+		var loadUsed bool
+		for i := range outputs {
+			if outputs[i].Type == client.ExporterDocker {
+				if _, ok := outputs[i].Attrs["dest"]; !ok {
+					loadUsed = true
+					break
+				}
+			}
+		}
+		if !loadUsed {
+			outputs = append(outputs, client.ExportEntry{
+				Type:  client.ExporterDocker,
 				Attrs: map[string]string{},
-			}}
-		} else {
-			switch outputs[0].Type {
-			case "docker":
-			default:
-				return nil, errors.Errorf("load and %q output can't be used together", outputs[0].Type)
-			}
+			})
 		}
 	}
+
+	annotations, err := buildflags.ParseAnnotations(in.Annotations)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "parse annotations")
+	}
+
+	for _, o := range outputs {
+		for k, v := range annotations {
+			o.Attrs[k.String()] = v
+		}
+	}
+
 	opts.Exports = outputs
 
-	inAttests := append([]string{}, in.Attests...)
-	if in.Opts.Provenance != "" {
-		inAttests = append(inAttests, buildflags.CanonicalizeAttest("provenance", in.Opts.Provenance))
-	}
-	if in.Opts.SBOM != "" {
-		inAttests = append(inAttests, buildflags.CanonicalizeAttest("sbom", in.Opts.SBOM))
-	}
-	opts.Attests, err = buildflags.ParseAttests(inAttests)
-	if err != nil {
-		return nil, err
-	}
+	opts.CacheFrom = controllerapi.CreateCaches(in.CacheFrom)
+	opts.CacheTo = controllerapi.CreateCaches(in.CacheTo)
 
-	cacheImports, err := buildflags.ParseCacheEntry(in.CacheFrom)
-	if err != nil {
-		return nil, err
-	}
-	opts.CacheFrom = cacheImports
+	opts.Attests = controllerapi.CreateAttestations(in.Attests)
 
-	cacheExports, err := buildflags.ParseCacheEntry(in.CacheTo)
-	if err != nil {
-		return nil, err
-	}
-	opts.CacheTo = cacheExports
+	opts.SourcePolicy = in.SourcePolicy
 
 	allow, err := buildflags.ParseEntitlements(in.Allow)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	opts.Allow = allow
+
+	if in.CallFunc != nil {
+		opts.CallFunc = &build.CallFunc{
+			Name:         in.CallFunc.Name,
+			Format:       in.CallFunc.Format,
+			IgnoreStatus: in.CallFunc.IgnoreStatus,
+		}
+	}
 
 	// key string used for kubernetes "sticky" mode
 	contextPathHash, err := filepath.Abs(in.ContextPath)
@@ -186,213 +174,62 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 		contextPathHash = in.ContextPath
 	}
 
+	// TODO: this should not be loaded this side of the controller api
 	b, err := builder.New(dockerCli,
-		builder.WithName(in.Opts.Builder),
+		builder.WithName(in.Builder),
 		builder.WithContextPathHash(contextPathHash),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	if err = updateLastActivity(dockerCli, b.NodeGroup); err != nil {
-		return nil, errors.Wrapf(err, "failed to update builder last activity time")
+		return nil, nil, nil, errors.Wrapf(err, "failed to update builder last activity time")
 	}
-	nodes, err := b.LoadNodes(ctx, false)
+	nodes, err := b.LoadNodes(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
-	imageID, res, err := buildTargets(ctx, dockerCli, b.NodeGroup, nodes, map[string]build.Options{defaultTargetName: opts}, progressMode, in.Opts.MetadataFile, statusChan)
+	var inputs *build.Inputs
+	buildOptions := map[string]build.Options{defaultTargetName: opts}
+	resp, res, err := buildTargets(ctx, dockerCli, nodes, buildOptions, progress, generateResult)
 	err = wrapBuildError(err, false)
 	if err != nil {
-		return nil, err
+		// NOTE: buildTargets can return *build.ResultHandle even on error.
+		return nil, res, nil, err
 	}
-
-	if in.Quiet {
-		fmt.Println(imageID)
+	if i, ok := buildOptions[defaultTargetName]; ok {
+		inputs = &i.Inputs
 	}
-	return res, nil
+	return resp, res, inputs, nil
 }
 
-func buildTargets(ctx context.Context, dockerCli command.Cli, ng *store.NodeGroup, nodes []builder.Node, opts map[string]build.Options, progressMode string, metadataFile string, statusChan chan *client.SolveStatus) (imageID string, res *build.ResultContext, err error) {
-	ctx2, cancel := context.WithCancel(context.TODO())
-	defer cancel()
-
-	printer, err := progress.NewPrinter(ctx2, os.Stderr, os.Stderr, progressMode, progressui.WithDesc(
-		fmt.Sprintf("building with %q instance using %s driver", ng.Name, ng.Driver),
-		fmt.Sprintf("%s:%s", ng.Driver, ng.Name),
-	))
-	if err != nil {
-		return "", nil, err
-	}
-
-	var mu sync.Mutex
-	var idx int
-	resp, err := build.BuildWithResultHandler(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.ConfigDir(dockerCli), progress.Tee(printer, statusChan), func(driverIndex int, gotRes *build.ResultContext) {
-		mu.Lock()
-		defer mu.Unlock()
-		if res == nil || driverIndex < idx {
-			idx, res = driverIndex, gotRes
-		}
-	})
-	err1 := printer.Wait()
-	if err == nil {
-		err = err1
-	}
-	if err != nil {
-		return "", nil, err
-	}
-
-	if len(metadataFile) > 0 && resp != nil {
-		if err := writeMetadataFile(metadataFile, decodeExporterResponse(resp[defaultTargetName].ExporterResponse)); err != nil {
-			return "", nil, err
-		}
-	}
-
-	printWarnings(os.Stderr, printer.Warnings(), progressMode)
-
-	for k := range resp {
-		if opts[k].PrintFunc != nil {
-			if err := printResult(opts[k].PrintFunc, resp[k].ExporterResponse); err != nil {
-				return "", nil, err
+// buildTargets runs the specified build and returns the result.
+//
+// NOTE: When an error happens during the build and this function acquires the debuggable *build.ResultHandle,
+// this function returns it in addition to the error (i.e. it does "return nil, res, err"). The caller can
+// inspect the result and debug the cause of that error.
+func buildTargets(ctx context.Context, dockerCli command.Cli, nodes []builder.Node, opts map[string]build.Options, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, error) {
+	var res *build.ResultHandle
+	var resp map[string]*client.SolveResponse
+	var err error
+	if generateResult {
+		var mu sync.Mutex
+		var idx int
+		resp, err = build.BuildWithResultHandler(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), progress, func(driverIndex int, gotRes *build.ResultHandle) {
+			mu.Lock()
+			defer mu.Unlock()
+			if res == nil || driverIndex < idx {
+				idx, res = driverIndex, gotRes
 			}
-		}
-	}
-
-	return resp[defaultTargetName].ExporterResponse["containerimage.digest"], res, err
-}
-
-func printWarnings(w io.Writer, warnings []client.VertexWarning, mode string) {
-	if len(warnings) == 0 || mode == progress.PrinterModeQuiet {
-		return
-	}
-	fmt.Fprintf(w, "\n ")
-	sb := &bytes.Buffer{}
-	if len(warnings) == 1 {
-		fmt.Fprintf(sb, "1 warning found")
+		})
 	} else {
-		fmt.Fprintf(sb, "%d warnings found", len(warnings))
+		resp, err = build.Build(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), progress)
 	}
-	if logrus.GetLevel() < logrus.DebugLevel {
-		fmt.Fprintf(sb, " (use --debug to expand)")
-	}
-	fmt.Fprintf(sb, ":\n")
-	fmt.Fprint(w, aec.Apply(sb.String(), aec.YellowF))
-
-	for _, warn := range warnings {
-		fmt.Fprintf(w, " - %s\n", warn.Short)
-		if logrus.GetLevel() < logrus.DebugLevel {
-			continue
-		}
-		for _, d := range warn.Detail {
-			fmt.Fprintf(w, "%s\n", d)
-		}
-		if warn.URL != "" {
-			fmt.Fprintf(w, "More info: %s\n", warn.URL)
-		}
-		if warn.SourceInfo != nil && warn.Range != nil {
-			src := errdefs.Source{
-				Info:   warn.SourceInfo,
-				Ranges: warn.Range,
-			}
-			src.Print(w)
-		}
-		fmt.Fprintf(w, "\n")
-
-	}
-}
-
-func listToMap(values []string, defaultEnv bool) map[string]string {
-	result := make(map[string]string, len(values))
-	for _, value := range values {
-		kv := strings.SplitN(value, "=", 2)
-		if len(kv) == 1 {
-			if defaultEnv {
-				v, ok := os.LookupEnv(kv[0])
-				if ok {
-					result[kv[0]] = v
-				}
-			} else {
-				result[kv[0]] = ""
-			}
-		} else {
-			result[kv[0]] = kv[1]
-		}
-	}
-	return result
-}
-
-func parseContextNames(values []string) (map[string]build.NamedContext, error) {
-	if len(values) == 0 {
-		return nil, nil
-	}
-	result := make(map[string]build.NamedContext, len(values))
-	for _, value := range values {
-		kv := strings.SplitN(value, "=", 2)
-		if len(kv) != 2 {
-			return nil, errors.Errorf("invalid context value: %s, expected key=value", value)
-		}
-		named, err := reference.ParseNormalizedNamed(kv[0])
-		if err != nil {
-			return nil, errors.Wrapf(err, "invalid context name %s", kv[0])
-		}
-		name := strings.TrimSuffix(reference.FamiliarString(named), ":latest")
-		result[name] = build.NamedContext{Path: kv[1]}
-	}
-	return result, nil
-}
-
-func parsePrintFunc(str string) (*build.PrintFunc, error) {
-	if str == "" {
-		return nil, nil
-	}
-	csvReader := csv.NewReader(strings.NewReader(str))
-	fields, err := csvReader.Read()
 	if err != nil {
-		return nil, err
+		return nil, res, err
 	}
-	f := &build.PrintFunc{}
-	for _, field := range fields {
-		parts := strings.SplitN(field, "=", 2)
-		if len(parts) == 2 {
-			if parts[0] == "format" {
-				f.Format = parts[1]
-			} else {
-				return nil, errors.Errorf("invalid print field: %s", field)
-			}
-		} else {
-			if f.Name != "" {
-				return nil, errors.Errorf("invalid print value: %s", str)
-			}
-			f.Name = field
-		}
-	}
-	return f, nil
-}
-
-func writeMetadataFile(filename string, dt interface{}) error {
-	b, err := json.MarshalIndent(dt, "", "  ")
-	if err != nil {
-		return err
-	}
-	return ioutils.AtomicWriteFile(filename, b, 0644)
-}
-
-func decodeExporterResponse(exporterResponse map[string]string) map[string]interface{} {
-	out := make(map[string]interface{})
-	for k, v := range exporterResponse {
-		dt, err := base64.StdEncoding.DecodeString(v)
-		if err != nil {
-			out[k] = v
-			continue
-		}
-		var raw map[string]interface{}
-		if err = json.Unmarshal(dt, &raw); err != nil || len(raw) == 0 {
-			out[k] = v
-			continue
-		}
-		out[k] = json.RawMessage(dt)
-	}
-	return out
+	return resp[defaultTargetName], res, err
 }
 
 func wrapBuildError(err error, bake bool) error {
@@ -439,9 +276,9 @@ func controllerUlimitOpt2DockerUlimit(u *controllerapi.UlimitOpt) *dockeropts.Ul
 	if u == nil {
 		return nil
 	}
-	values := make(map[string]*units.Ulimit)
+	values := make(map[string]*container.Ulimit)
 	for k, v := range u.Values {
-		values[k] = &units.Ulimit{
+		values[k] = &container.Ulimit{
 			Name: v.Name,
 			Hard: v.Hard,
 			Soft: v.Soft,

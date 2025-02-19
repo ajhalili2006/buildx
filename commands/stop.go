@@ -4,9 +4,9 @@ import (
 	"context"
 
 	"github.com/docker/buildx/builder"
+	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
-	"github.com/moby/buildkit/util/appcontext"
 	"github.com/spf13/cobra"
 )
 
@@ -14,9 +14,7 @@ type stopOptions struct {
 	builder string
 }
 
-func runStop(dockerCli command.Cli, in stopOptions) error {
-	ctx := appcontext.Context()
-
+func runStop(ctx context.Context, dockerCli command.Cli, in stopOptions) error {
 	b, err := builder.New(dockerCli,
 		builder.WithName(in.builder),
 		builder.WithSkippedValidation(),
@@ -24,7 +22,7 @@ func runStop(dockerCli command.Cli, in stopOptions) error {
 	if err != nil {
 		return err
 	}
-	nodes, err := b.LoadNodes(ctx, false)
+	nodes, err := b.LoadNodes(ctx)
 	if err != nil {
 		return err
 	}
@@ -44,8 +42,9 @@ func stopCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 			if len(args) > 0 {
 				options.builder = args[0]
 			}
-			return runStop(dockerCli, options)
+			return runStop(cmd.Context(), dockerCli, options)
 		},
+		ValidArgsFunction: completion.BuilderNames(dockerCli),
 	}
 
 	return cmd

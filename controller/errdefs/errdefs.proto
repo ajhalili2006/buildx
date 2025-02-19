@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package docker.buildx.errdefs;
+
+option go_package = "github.com/docker/buildx/controller/errdefs";
+
+message Build {
+  string SessionID = 1;
+  string Ref = 2;
+}

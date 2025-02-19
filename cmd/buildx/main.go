@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
-	"github.com/containerd/containerd/pkg/seed"
 	"github.com/docker/buildx/commands"
+	controllererrors "github.com/docker/buildx/controller/errdefs"
+	"github.com/docker/buildx/util/desktop"
 	"github.com/docker/buildx/version"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli-plugins/manager"
@@ -15,20 +18,21 @@ import (
 	cliflags "github.com/docker/cli/cli/flags"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/util/stack"
+	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel"
 
-	_ "k8s.io/client-go/plugin/pkg/client/auth/azure"
-	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
-	_ "k8s.io/client-go/plugin/pkg/client/auth/openstack"
 
 	_ "github.com/docker/buildx/driver/docker"
 	_ "github.com/docker/buildx/driver/docker-container"
 	_ "github.com/docker/buildx/driver/kubernetes"
 	_ "github.com/docker/buildx/driver/remote"
+
+	// Use custom grpc codec to utilize vtprotobuf
+	_ "github.com/moby/buildkit/util/grpcutil/encoding/proto"
 )
 
 func init() {
-	seed.WithTimeAndRand()
 	stack.SetVersionInfo(version.Version, version.Revision)
 }
 
@@ -36,8 +40,26 @@ func runStandalone(cmd *command.DockerCli) error {
 	if err := cmd.Initialize(cliflags.NewClientOptions()); err != nil {
 		return err
 	}
-	rootCmd := commands.NewRootCmd(os.Args[0], false, cmd)
+	defer flushMetrics(cmd)
+
+	executable := os.Args[0]
+	rootCmd := commands.NewRootCmd(filepath.Base(executable), false, cmd)
 	return rootCmd.Execute()
+}
+
+// flushMetrics will manually flush metrics from the configured
+// meter provider. This is needed when running in standalone mode
+// because the meter provider is initialized by the cli library,
+// but the mechanism for forcing it to report is not presently
+// exposed and not invoked when run in standalone mode.
+// There are plans to fix that in the next release, but this is
+// needed temporarily until the API for this is more thorough.
+func flushMetrics(cmd *command.DockerCli) {
+	if mp, ok := cmd.MeterProvider().(command.MeterProvider); ok {
+		if err := mp.ForceFlush(context.Background()); err != nil {
+			otel.Handle(err)
+		}
+	}
 }
 
 func runPlugin(cmd *command.DockerCli) error {
@@ -49,6 +71,16 @@ func runPlugin(cmd *command.DockerCli) error {
 	})
 }
 
+func run(cmd *command.DockerCli) error {
+	stopProfiles := setupDebugProfiles(context.TODO())
+	defer stopProfiles()
+
+	if plugin.RunningStandalone() {
+		return runStandalone(cmd)
+	}
+	return runPlugin(cmd)
+}
+
 func main() {
 	cmd, err := command.NewDockerCli()
 	if err != nil {
@@ -56,15 +88,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if plugin.RunningStandalone() {
-		err = runStandalone(cmd)
-	} else {
-		err = runPlugin(cmd)
-	}
-	if err == nil {
+	if err = run(cmd); err == nil {
 		return
 	}
 
+	// Check the error from the run function above.
 	if sterr, ok := err.(cli.StatusError); ok {
 		if sterr.Status != "" {
 			fmt.Fprintln(cmd.Err(), sterr.Status)
@@ -84,6 +112,16 @@ func main() {
 		fmt.Fprintf(cmd.Err(), "ERROR: %+v", stack.Formatter(err))
 	} else {
 		fmt.Fprintf(cmd.Err(), "ERROR: %v\n", err)
+	}
+
+	var ebr *desktop.ErrorWithBuildRef
+	if errors.As(err, &ebr) {
+		ebr.Print(cmd.Err())
+	} else {
+		var be *controllererrors.BuildError
+		if errors.As(err, &be) {
+			be.PrintBuildDetails(cmd.Err())
+		}
 	}
 
 	os.Exit(1)

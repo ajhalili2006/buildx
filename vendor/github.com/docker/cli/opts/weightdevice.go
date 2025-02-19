@@ -65,7 +65,7 @@ func (opt *WeightdeviceOpt) Set(val string) error {
 
 // String returns WeightdeviceOpt values as a string.
 func (opt *WeightdeviceOpt) String() string {
-	var out []string
+	out := make([]string, 0, len(opt.values))
 	for _, v := range opt.values {
 		out = append(out, v.String())
 	}
@@ -79,6 +79,6 @@ func (opt *WeightdeviceOpt) GetList() []*blkiodev.WeightDevice {
 }
 
 // Type returns the option type
-func (opt *WeightdeviceOpt) Type() string {
+func (*WeightdeviceOpt) Type() string {
 	return "list"
 }

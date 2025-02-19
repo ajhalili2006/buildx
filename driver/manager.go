@@ -2,15 +2,13 @@ package driver
 
 import (
 	"context"
-	"os"
 	"sort"
-	"strings"
 	"sync"
 
-	"k8s.io/client-go/rest"
-
+	"github.com/docker/cli/cli/context/store"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/util/tracing/delegated"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
@@ -18,7 +16,7 @@ import (
 type Factory interface {
 	Name() string
 	Usage() string
-	Priority(ctx context.Context, endpoint string, api dockerclient.APIClient) int
+	Priority(ctx context.Context, endpoint string, api dockerclient.APIClient, dialMeta map[string][]string) int
 	New(ctx context.Context, cfg InitConfig) (Driver, error)
 	AllowsInstances() bool
 }
@@ -28,38 +26,18 @@ type BuildkitConfig struct {
 	// Rootless bool
 }
 
-type KubeClientConfig interface {
-	ClientConfig() (*rest.Config, error)
-	Namespace() (string, bool, error)
-}
-
-type KubeClientConfigInCluster struct{}
-
-func (k KubeClientConfigInCluster) ClientConfig() (*rest.Config, error) {
-	return rest.InClusterConfig()
-}
-
-func (k KubeClientConfigInCluster) Namespace() (string, bool, error) {
-	namespace, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-	if err != nil {
-		return "", false, err
-	}
-	return strings.TrimSpace(string(namespace)), true, nil
-}
-
 type InitConfig struct {
-	// This object needs updates to be generic for different drivers
-	Name             string
-	EndpointAddr     string
-	DockerAPI        dockerclient.APIClient
-	KubeClientConfig KubeClientConfig
-	BuildkitFlags    []string
-	Files            map[string][]byte
-	DriverOpts       map[string]string
-	Auth             Auth
-	Platforms        []specs.Platform
-	// ContextPathHash can be used for determining pods in the driver instance
+	Name            string
+	EndpointAddr    string
+	DockerAPI       dockerclient.APIClient
+	ContextStore    store.Reader
+	BuildkitdFlags  []string
+	Files           map[string][]byte
+	DriverOpts      map[string]string
+	Auth            Auth
+	Platforms       []specs.Platform
 	ContextPathHash string
+	DialMeta        map[string][]string
 }
 
 var drivers map[string]Factory
@@ -71,7 +49,7 @@ func Register(f Factory) {
 	drivers[f.Name()] = f
 }
 
-func GetDefaultFactory(ctx context.Context, ep string, c dockerclient.APIClient, instanceRequired bool) (Factory, error) {
+func GetDefaultFactory(ctx context.Context, ep string, c dockerclient.APIClient, instanceRequired bool, dialMeta map[string][]string) (Factory, error) {
 	if len(drivers) == 0 {
 		return nil, errors.Errorf("no drivers available")
 	}
@@ -84,7 +62,7 @@ func GetDefaultFactory(ctx context.Context, ep string, c dockerclient.APIClient,
 		if instanceRequired && !f.AllowsInstances() {
 			continue
 		}
-		dd = append(dd, p{f: f, priority: f.Priority(ctx, ep, c)})
+		dd = append(dd, p{f: f, priority: f.Priority(ctx, ep, c, dialMeta)})
 	}
 	sort.Slice(dd, func(i, j int) bool {
 		return dd[i].priority < dd[j].priority
@@ -104,31 +82,19 @@ func GetFactory(name string, instanceRequired bool) (Factory, error) {
 	return nil, errors.Errorf("failed to find driver %q", name)
 }
 
-func GetDriver(ctx context.Context, name string, f Factory, endpointAddr string, api dockerclient.APIClient, auth Auth, kcc KubeClientConfig, flags []string, files map[string][]byte, do map[string]string, platforms []specs.Platform, contextPathHash string) (Driver, error) {
-	ic := InitConfig{
-		EndpointAddr:     endpointAddr,
-		DockerAPI:        api,
-		KubeClientConfig: kcc,
-		Name:             name,
-		BuildkitFlags:    flags,
-		DriverOpts:       do,
-		Auth:             auth,
-		Platforms:        platforms,
-		ContextPathHash:  contextPathHash,
-		Files:            files,
-	}
+func GetDriver(ctx context.Context, f Factory, cfg InitConfig) (*DriverHandle, error) {
 	if f == nil {
 		var err error
-		f, err = GetDefaultFactory(ctx, endpointAddr, api, false)
+		f, err = GetDefaultFactory(ctx, cfg.EndpointAddr, cfg.DockerAPI, false, cfg.DialMeta)
 		if err != nil {
 			return nil, err
 		}
 	}
-	d, err := f.New(ctx, ic)
+	d, err := f.New(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &cachedDriver{Driver: d}, nil
+	return &DriverHandle{Driver: d}, nil
 }
 
 func GetFactories(instanceRequired bool) []Factory {
@@ -145,16 +111,33 @@ func GetFactories(instanceRequired bool) []Factory {
 	return ds
 }
 
-type cachedDriver struct {
+type DriverHandle struct {
 	Driver
-	client *client.Client
-	err    error
-	once   sync.Once
+	client                  *client.Client
+	err                     error
+	once                    sync.Once
+	historyAPISupportedOnce sync.Once
+	historyAPISupported     bool
 }
 
-func (d *cachedDriver) Client(ctx context.Context) (*client.Client, error) {
+func (d *DriverHandle) Client(ctx context.Context, opt ...client.ClientOpt) (*client.Client, error) {
 	d.once.Do(func() {
-		d.client, d.err = d.Driver.Client(ctx)
+		d.client, d.err = d.Driver.Client(ctx, append(d.getClientOptions(), opt...)...)
 	})
 	return d.client, d.err
+}
+
+func (d *DriverHandle) getClientOptions() []client.ClientOpt {
+	return []client.ClientOpt{
+		client.WithTracerDelegate(delegated.DefaultExporter),
+	}
+}
+
+func (d *DriverHandle) HistoryAPISupported(ctx context.Context) bool {
+	d.historyAPISupportedOnce.Do(func() {
+		if c, err := d.Client(ctx); err == nil {
+			d.historyAPISupported = historyAPISupported(ctx, c)
+		}
+	})
+	return d.historyAPISupported
 }

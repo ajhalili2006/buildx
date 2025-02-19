@@ -4,16 +4,23 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"os"
 	"strings"
 
 	"github.com/docker/buildx/builder"
+	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/driver"
 	"github.com/docker/buildx/util/progress"
+	"github.com/docker/go-units"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/frontend/dockerui"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
+	"github.com/moby/buildkit/session"
 	"github.com/pkg/errors"
 )
+
+const maxBakeDefinitionSize = 2 * 1024 * 1024 // 2 MB
 
 type Input struct {
 	State *llb.State
@@ -21,10 +28,37 @@ type Input struct {
 }
 
 func ReadRemoteFiles(ctx context.Context, nodes []builder.Node, url string, names []string, pw progress.Writer) ([]File, *Input, error) {
+	var sessions []session.Attachable
 	var filename string
-	st, ok := detectGitContext(url)
-	if !ok {
-		st, filename, ok = detectHTTPContext(url)
+
+	st, ok := dockerui.DetectGitContext(url, false)
+	if ok {
+		if ssh, err := controllerapi.CreateSSH([]*controllerapi.SSH{{
+			ID:    "default",
+			Paths: strings.Split(os.Getenv("BUILDX_BAKE_GIT_SSH"), ","),
+		}}); err == nil {
+			sessions = append(sessions, ssh)
+		}
+		var gitAuthSecrets []*controllerapi.Secret
+		if _, ok := os.LookupEnv("BUILDX_BAKE_GIT_AUTH_TOKEN"); ok {
+			gitAuthSecrets = append(gitAuthSecrets, &controllerapi.Secret{
+				ID:  llb.GitAuthTokenKey,
+				Env: "BUILDX_BAKE_GIT_AUTH_TOKEN",
+			})
+		}
+		if _, ok := os.LookupEnv("BUILDX_BAKE_GIT_AUTH_HEADER"); ok {
+			gitAuthSecrets = append(gitAuthSecrets, &controllerapi.Secret{
+				ID:  llb.GitAuthHeaderKey,
+				Env: "BUILDX_BAKE_GIT_AUTH_HEADER",
+			})
+		}
+		if len(gitAuthSecrets) > 0 {
+			if secrets, err := controllerapi.CreateSecrets(gitAuthSecrets); err == nil {
+				sessions = append(sessions, secrets)
+			}
+		}
+	} else {
+		st, filename, ok = dockerui.DetectHTTPContext(url)
 		if !ok {
 			return nil, nil, errors.Errorf("not url context")
 		}
@@ -51,7 +85,7 @@ func ReadRemoteFiles(ctx context.Context, nodes []builder.Node, url string, name
 
 	ch, done := progress.NewChannel(pw)
 	defer func() { <-done }()
-	_, err = c.Build(ctx, client.SolveOpt{}, "buildx", func(ctx context.Context, c gwclient.Client) (*gwclient.Result, error) {
+	_, err = c.Build(ctx, client.SolveOpt{Session: sessions, Internal: true}, "buildx", func(ctx context.Context, c gwclient.Client) (*gwclient.Result, error) {
 		def, err := st.Marshal(ctx)
 		if err != nil {
 			return nil, err
@@ -75,57 +109,11 @@ func ReadRemoteFiles(ctx context.Context, nodes []builder.Node, url string, name
 		}
 		return nil, err
 	}, ch)
-
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return files, inp, nil
-}
-
-func IsRemoteURL(url string) bool {
-	if _, _, ok := detectHTTPContext(url); ok {
-		return true
-	}
-	if _, ok := detectGitContext(url); ok {
-		return true
-	}
-	return false
-}
-
-func detectHTTPContext(url string) (*llb.State, string, bool) {
-	if httpPrefix.MatchString(url) {
-		httpContext := llb.HTTP(url, llb.Filename("context"), llb.WithCustomName("[internal] load remote build context"))
-		return &httpContext, "context", true
-	}
-	return nil, "", false
-}
-
-func detectGitContext(ref string) (*llb.State, bool) {
-	found := false
-	if httpPrefix.MatchString(ref) && gitURLPathWithFragmentSuffix.MatchString(ref) {
-		found = true
-	}
-
-	for _, prefix := range []string{"git://", "github.com/", "git@"} {
-		if strings.HasPrefix(ref, prefix) {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return nil, false
-	}
-
-	parts := strings.SplitN(ref, "#", 2)
-	branch := ""
-	if len(parts) > 1 {
-		branch = parts[1]
-	}
-	gitOpts := []llb.GitOption{llb.WithCustomName("[internal] load git source " + ref)}
-
-	st := llb.Git(parts[0], branch, gitOpts...)
-	return &st, true
 }
 
 func isArchive(header []byte) bool {
@@ -192,9 +180,9 @@ func filesFromURLRef(ctx context.Context, c gwclient.Client, ref gwclient.Refere
 	name := inp.URL
 	inp.URL = ""
 
-	if len(dt) > stat.Size() {
-		if stat.Size() > 1024*512 {
-			return nil, errors.Errorf("non-archive definition URL bigger than maximum allowed size")
+	if int64(len(dt)) > stat.Size {
+		if stat.Size > maxBakeDefinitionSize {
+			return nil, errors.Errorf("non-archive definition URL bigger than maximum allowed size (%s)", units.HumanSize(maxBakeDefinitionSize))
 		}
 
 		dt, err = ref.ReadFile(ctx, gwclient.ReadRequest{

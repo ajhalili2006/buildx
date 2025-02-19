@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 
-	"github.com/containerd/typeurl"
+	"github.com/containerd/typeurl/v2"
 	"github.com/golang/protobuf/jsonpb" //nolint:staticcheck
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/grpcerrors"
@@ -20,7 +20,7 @@ type IsSolve_Subject isSolve_Subject
 // SolveError will be returned when an error is encountered during a solve that
 // has an exec op.
 type SolveError struct {
-	Solve
+	*Solve
 	Err error
 }
 
@@ -33,7 +33,7 @@ func (e *SolveError) Unwrap() error {
 }
 
 func (e *SolveError) ToProto() grpcerrors.TypedErrorProto {
-	return &e.Solve
+	return e.Solve
 }
 
 func WithSolveError(err error, subject IsSolve_Subject, inputIDs, mountIDs []string) error {
@@ -41,25 +41,28 @@ func WithSolveError(err error, subject IsSolve_Subject, inputIDs, mountIDs []str
 		return nil
 	}
 	var (
-		oe *OpError
-		op *pb.Op
+		oe          *OpError
+		op          *pb.Op
+		description map[string]string
 	)
 	if errors.As(err, &oe) {
 		op = oe.Op
+		description = oe.Description
 	}
 	return &SolveError{
 		Err: err,
-		Solve: Solve{
-			InputIDs: inputIDs,
-			MountIDs: mountIDs,
-			Op:       op,
-			Subject:  subject,
+		Solve: &Solve{
+			InputIDs:    inputIDs,
+			MountIDs:    mountIDs,
+			Op:          op,
+			Subject:     subject,
+			Description: description,
 		},
 	}
 }
 
 func (v *Solve) WrapError(err error) error {
-	return &SolveError{Err: err, Solve: *v}
+	return &SolveError{Err: err, Solve: v}
 }
 
 func (v *Solve) MarshalJSON() ([]byte, error) {

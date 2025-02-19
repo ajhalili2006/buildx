@@ -15,15 +15,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd/log"
+	"github.com/containerd/log"
 	"github.com/docker/buildx/build"
 	cbuild "github.com/docker/buildx/controller/build"
 	"github.com/docker/buildx/controller/control"
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/util/confutil"
+	"github.com/docker/buildx/util/progress"
 	"github.com/docker/buildx/version"
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -52,7 +54,7 @@ type serverConfig struct {
 	LogFile string `toml:"log_file"`
 }
 
-func NewRemoteBuildxController(ctx context.Context, dockerCli command.Cli, opts control.ControlOptions) (control.BuildxController, error) {
+func NewRemoteBuildxController(ctx context.Context, dockerCli command.Cli, opts control.ControlOptions, logger progress.SubLogger) (control.BuildxController, error) {
 	rootDir := opts.Root
 	if rootDir == "" {
 		rootDir = rootDataDir(dockerCli)
@@ -60,9 +62,10 @@ func NewRemoteBuildxController(ctx context.Context, dockerCli command.Cli, opts 
 	serverRoot := filepath.Join(rootDir, "shared")
 
 	// connect to buildx server if it is already running
-	ctx2, cancel := context.WithTimeout(ctx, 1*time.Second)
+	ctx2, cancel := context.WithCancelCause(ctx)
+	ctx2, _ = context.WithTimeoutCause(ctx2, 1*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet,lostcancel // no need to manually cancel this context as we already rely on parent
 	c, err := newBuildxClientAndCheck(ctx2, filepath.Join(serverRoot, defaultSocketFilename))
-	cancel()
+	cancel(errors.WithStack(context.Canceled))
 	if err != nil {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			return nil, errors.Wrap(err, "cannot connect to the buildx server")
@@ -72,27 +75,33 @@ func NewRemoteBuildxController(ctx context.Context, dockerCli command.Cli, opts 
 	}
 
 	// start buildx server via subcommand
-	logrus.Info("no buildx server found; launching...")
-	launchFlags := []string{}
-	if opts.ServerConfig != "" {
-		launchFlags = append(launchFlags, "--config", opts.ServerConfig)
-	}
-	logFile, err := getLogFilePath(dockerCli, opts.ServerConfig)
-	if err != nil {
-		return nil, err
-	}
-	wait, err := launch(ctx, logFile, append([]string{serveCommandName}, launchFlags...)...)
-	if err != nil {
-		return nil, err
-	}
-	go wait()
+	err = logger.Wrap("no buildx server found; launching...", func() error {
+		launchFlags := []string{}
+		if opts.ServerConfig != "" {
+			launchFlags = append(launchFlags, "--config", opts.ServerConfig)
+		}
+		logFile, err := getLogFilePath(dockerCli, opts.ServerConfig)
+		if err != nil {
+			return err
+		}
+		wait, err := launch(ctx, logFile, append([]string{serveCommandName}, launchFlags...)...)
+		if err != nil {
+			return err
+		}
+		go wait()
 
-	// wait for buildx server to be ready
-	ctx2, cancel = context.WithTimeout(ctx, 10*time.Second)
-	c, err = newBuildxClientAndCheck(ctx2, filepath.Join(serverRoot, defaultSocketFilename))
-	cancel()
+		// wait for buildx server to be ready
+		ctx2, cancel = context.WithCancelCause(ctx)
+		ctx2, _ = context.WithTimeoutCause(ctx2, 10*time.Second, errors.WithStack(context.DeadlineExceeded)) //nolint:govet,lostcancel // no need to manually cancel this context as we already rely on parent
+		c, err = newBuildxClientAndCheck(ctx2, filepath.Join(serverRoot, defaultSocketFilename))
+		cancel(errors.WithStack(context.Canceled))
+		if err != nil {
+			return errors.Wrap(err, "cannot connect to the buildx server")
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, errors.Wrap(err, "cannot connect to the buildx server")
+		return nil, err
 	}
 	return &buildxController{c, serverRoot}, nil
 }
@@ -141,8 +150,8 @@ func serveCmd(dockerCli command.Cli) *cobra.Command {
 			}()
 
 			// prepare server
-			b := NewServer(func(ctx context.Context, options *controllerapi.BuildOptions, stdin io.Reader, statusChan chan *client.SolveStatus) (res *build.ResultContext, err error) {
-				return cbuild.RunBuild(ctx, dockerCli, *options, stdin, "quiet", statusChan)
+			b := NewServer(func(ctx context.Context, options *controllerapi.BuildOptions, stdin io.Reader, progress progress.Writer) (*client.SolveResponse, *build.ResultHandle, *build.Inputs, error) {
+				return cbuild.RunBuild(ctx, dockerCli, options, stdin, progress, true)
 			})
 			defer b.Close()
 
@@ -161,7 +170,10 @@ func serveCmd(dockerCli command.Cli) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			rpc := grpc.NewServer()
+			rpc := grpc.NewServer(
+				grpc.UnaryInterceptor(grpcerrors.UnaryServerInterceptor),
+				grpc.StreamInterceptor(grpcerrors.StreamServerInterceptor),
+			)
 			controllerapi.RegisterControllerServer(rpc, b)
 			doneCh := make(chan struct{})
 			errCh := make(chan error, 1)
@@ -248,7 +260,7 @@ func prepareRootDir(dockerCli command.Cli, config *serverConfig) (string, error)
 }
 
 func rootDataDir(dockerCli command.Cli) string {
-	return filepath.Join(confutil.ConfigDir(dockerCli), "controller")
+	return filepath.Join(confutil.NewConfig(dockerCli).Dir(), "controller")
 }
 
 func newBuildxClientAndCheck(ctx context.Context, addr string) (*Client, error) {
@@ -297,7 +309,7 @@ func (c *buildxController) Kill(ctx context.Context) error {
 
 func launch(ctx context.Context, logFile string, args ...string) (func() error, error) {
 	// set absolute path of binary, since we set the working directory to the root
-	pathname, err := filepath.Abs(os.Args[0])
+	pathname, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}

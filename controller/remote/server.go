@@ -4,20 +4,23 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/buildx/build"
+	controllererrors "github.com/docker/buildx/controller/errdefs"
 	"github.com/docker/buildx/controller/pb"
+	"github.com/docker/buildx/controller/processes"
+	"github.com/docker/buildx/util/desktop"
 	"github.com/docker/buildx/util/ioset"
+	"github.com/docker/buildx/util/progress"
 	"github.com/docker/buildx/version"
-	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
-type BuildFunc func(ctx context.Context, options *pb.BuildOptions, stdin io.Reader, statusChan chan *client.SolveStatus) (res *build.ResultContext, err error)
+type BuildFunc func(ctx context.Context, options *pb.BuildOptions, stdin io.Reader, progress progress.Writer) (resp *client.SolveResponse, res *build.ResultHandle, inp *build.Inputs, err error)
 
 func NewServer(buildFunc BuildFunc) *Server {
 	return &Server{
@@ -27,16 +30,46 @@ func NewServer(buildFunc BuildFunc) *Server {
 
 type Server struct {
 	buildFunc BuildFunc
-	session   map[string]session
+	session   map[string]*session
 	sessionMu sync.Mutex
 }
 
 type session struct {
-	statusChan      chan *client.SolveStatus
-	result          *build.ResultContext
-	inputPipe       *io.PipeWriter
-	curInvokeCancel func()
-	curBuildCancel  func()
+	buildOnGoing atomic.Bool
+	statusChan   chan *pb.StatusResponse
+	cancelBuild  func(error)
+	buildOptions *pb.BuildOptions
+	inputPipe    *io.PipeWriter
+
+	result *build.ResultHandle
+
+	processes *processes.Manager
+}
+
+func (s *session) cancelRunningProcesses() {
+	s.processes.CancelRunningProcesses()
+}
+
+func (m *Server) ListProcesses(ctx context.Context, req *pb.ListProcessesRequest) (res *pb.ListProcessesResponse, err error) {
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
+	s, ok := m.session[req.SessionID]
+	if !ok {
+		return nil, errors.Errorf("unknown session ID %q", req.SessionID)
+	}
+	res = new(pb.ListProcessesResponse)
+	res.Infos = append(res.Infos, s.processes.ListProcesses()...)
+	return res, nil
+}
+
+func (m *Server) DisconnectProcess(ctx context.Context, req *pb.DisconnectProcessRequest) (res *pb.DisconnectProcessResponse, err error) {
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
+	s, ok := m.session[req.SessionID]
+	if !ok {
+		return nil, errors.Errorf("unknown session ID %q", req.SessionID)
+	}
+	return res, s.processes.DeleteProcess(req.ProcessID)
 }
 
 func (m *Server) Info(ctx context.Context, req *pb.InfoRequest) (res *pb.InfoResponse, err error) {
@@ -68,21 +101,22 @@ func (m *Server) List(ctx context.Context, req *pb.ListRequest) (res *pb.ListRes
 }
 
 func (m *Server) Disconnect(ctx context.Context, req *pb.DisconnectRequest) (res *pb.DisconnectResponse, err error) {
-	key := req.Ref
-	if key == "" {
-		return nil, errors.New("disconnect: empty key")
+	sessionID := req.SessionID
+	if sessionID == "" {
+		return nil, errors.New("disconnect: empty session ID")
 	}
 
 	m.sessionMu.Lock()
-	if s, ok := m.session[key]; ok {
-		if s.curBuildCancel != nil {
-			s.curBuildCancel()
+	if s, ok := m.session[sessionID]; ok {
+		if s.cancelBuild != nil {
+			s.cancelBuild(errors.WithStack(context.Canceled))
 		}
-		if s.curInvokeCancel != nil {
-			s.curInvokeCancel()
+		s.cancelRunningProcesses()
+		if s.result != nil {
+			s.result.Done()
 		}
 	}
-	delete(m.session, key)
+	delete(m.session, sessionID)
 	m.sessionMu.Unlock()
 
 	return &pb.DisconnectResponse{}, nil
@@ -92,96 +126,134 @@ func (m *Server) Close() error {
 	m.sessionMu.Lock()
 	for k := range m.session {
 		if s, ok := m.session[k]; ok {
-			if s.curBuildCancel != nil {
-				s.curBuildCancel()
+			if s.cancelBuild != nil {
+				s.cancelBuild(errors.WithStack(context.Canceled))
 			}
-			if s.curInvokeCancel != nil {
-				s.curInvokeCancel()
-			}
+			s.cancelRunningProcesses()
 		}
 	}
 	m.sessionMu.Unlock()
 	return nil
 }
 
+func (m *Server) Inspect(ctx context.Context, req *pb.InspectRequest) (*pb.InspectResponse, error) {
+	sessionID := req.SessionID
+	if sessionID == "" {
+		return nil, errors.New("inspect: empty session ID")
+	}
+	var bo *pb.BuildOptions
+	m.sessionMu.Lock()
+	if s, ok := m.session[sessionID]; ok {
+		bo = s.buildOptions
+	} else {
+		m.sessionMu.Unlock()
+		return nil, errors.Errorf("inspect: unknown key %v", sessionID)
+	}
+	m.sessionMu.Unlock()
+	return &pb.InspectResponse{Options: bo}, nil
+}
+
 func (m *Server) Build(ctx context.Context, req *pb.BuildRequest) (*pb.BuildResponse, error) {
-	ref := req.Ref
-	if ref == "" {
-		return nil, errors.New("build: empty key")
+	sessionID := req.SessionID
+	if sessionID == "" {
+		return nil, errors.New("build: empty session ID")
 	}
 
-	// Prepare status channel and session if not exists
+	// Prepare status channel and session
 	m.sessionMu.Lock()
 	if m.session == nil {
-		m.session = make(map[string]session)
+		m.session = make(map[string]*session)
 	}
-	s, ok := m.session[ref]
-	if ok && m.session[ref].statusChan != nil {
-		m.sessionMu.Unlock()
-		return &pb.BuildResponse{}, errors.New("build or status ongoing or status didn't call")
+	s, ok := m.session[sessionID]
+	if ok {
+		if !s.buildOnGoing.CompareAndSwap(false, true) {
+			m.sessionMu.Unlock()
+			return &pb.BuildResponse{}, errors.New("build ongoing")
+		}
+		s.cancelRunningProcesses()
+		s.result = nil
+	} else {
+		s = &session{}
+		s.buildOnGoing.Store(true)
 	}
-	statusChan := make(chan *client.SolveStatus)
+
+	s.processes = processes.NewManager()
+	statusChan := make(chan *pb.StatusResponse)
 	s.statusChan = statusChan
-	m.session[ref] = session{statusChan: statusChan}
+	inR, inW := io.Pipe()
+	defer inR.Close()
+	s.inputPipe = inW
+	m.session[sessionID] = s
 	m.sessionMu.Unlock()
 	defer func() {
 		close(statusChan)
 		m.sessionMu.Lock()
-		s, ok := m.session[ref]
+		s, ok := m.session[sessionID]
 		if ok {
 			s.statusChan = nil
+			s.buildOnGoing.Store(false)
 		}
 		m.sessionMu.Unlock()
 	}()
 
-	// Prepare input stream pipe
-	inR, inW := io.Pipe()
-	m.sessionMu.Lock()
-	if s, ok := m.session[ref]; ok {
-		s.inputPipe = inW
-		m.session[ref] = s
-	} else {
-		m.sessionMu.Unlock()
-		return nil, errors.Errorf("build: unknown key %v", ref)
-	}
-	m.sessionMu.Unlock()
-	defer inR.Close()
+	pw := pb.NewProgressWriter(statusChan)
 
 	// Build the specified request
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	res, err := m.buildFunc(ctx, req.Options, inR, statusChan)
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
+	resp, res, _, buildErr := m.buildFunc(ctx, req.Options, inR, pw)
 	m.sessionMu.Lock()
-	if s, ok := m.session[ref]; ok {
-		s.result = res
-		s.curBuildCancel = cancel
-		m.session[ref] = s
+	if s, ok := m.session[sessionID]; ok {
+		// NOTE: buildFunc can return *build.ResultHandle even on error (e.g. when it's implemented using (github.com/docker/buildx/controller/build).RunBuild).
+		if res != nil {
+			s.result = res
+			s.cancelBuild = cancel
+			s.buildOptions = req.Options
+			m.session[sessionID] = s
+			if buildErr != nil {
+				var ref string
+				var ebr *desktop.ErrorWithBuildRef
+				if errors.As(buildErr, &ebr) {
+					ref = ebr.Ref
+				}
+				buildErr = controllererrors.WrapBuild(buildErr, sessionID, ref)
+			}
+		}
 	} else {
 		m.sessionMu.Unlock()
-		return nil, errors.Errorf("build: unknown key %v", ref)
+		return nil, errors.Errorf("build: unknown session ID %v", sessionID)
 	}
 	m.sessionMu.Unlock()
 
-	return &pb.BuildResponse{}, err
+	if buildErr != nil {
+		return nil, buildErr
+	}
+
+	if resp == nil {
+		resp = &client.SolveResponse{}
+	}
+	return &pb.BuildResponse{
+		ExporterResponse: resp.ExporterResponse,
+	}, nil
 }
 
 func (m *Server) Status(req *pb.StatusRequest, stream pb.Controller_StatusServer) error {
-	ref := req.Ref
-	if ref == "" {
-		return errors.New("status: empty key")
+	sessionID := req.SessionID
+	if sessionID == "" {
+		return errors.New("status: empty session ID")
 	}
 
 	// Wait and get status channel prepared by Build()
-	var statusChan <-chan *client.SolveStatus
+	var statusChan <-chan *pb.StatusResponse
 	for {
 		// TODO: timeout?
 		m.sessionMu.Lock()
-		if _, ok := m.session[ref]; !ok || m.session[ref].statusChan == nil {
+		if _, ok := m.session[sessionID]; !ok || m.session[sessionID].statusChan == nil {
 			m.sessionMu.Unlock()
 			time.Sleep(time.Millisecond) // TODO: wait Build without busy loop and make it cancellable
 			continue
 		}
-		statusChan = m.session[ref].statusChan
+		statusChan = m.session[sessionID].statusChan
 		m.sessionMu.Unlock()
 		break
 	}
@@ -191,8 +263,7 @@ func (m *Server) Status(req *pb.StatusRequest, stream pb.Controller_StatusServer
 		if ss == nil {
 			break
 		}
-		cs := toControlStatus(ss)
-		if err := stream.Send(cs); err != nil {
+		if err := stream.Send(ss); err != nil {
 			return err
 		}
 	}
@@ -213,9 +284,9 @@ func (m *Server) Input(stream pb.Controller_InputServer) (err error) {
 	if init == nil {
 		return errors.Errorf("unexpected message: %T; wanted init", msg.GetInit())
 	}
-	ref := init.Ref
-	if ref == "" {
-		return errors.New("input: no ref is provided")
+	sessionID := init.SessionID
+	if sessionID == "" {
+		return errors.New("input: no session ID is provided")
 	}
 
 	// Wait and get input stream pipe prepared by Build()
@@ -223,12 +294,12 @@ func (m *Server) Input(stream pb.Controller_InputServer) (err error) {
 	for {
 		// TODO: timeout?
 		m.sessionMu.Lock()
-		if _, ok := m.session[ref]; !ok || m.session[ref].inputPipe == nil {
+		if _, ok := m.session[sessionID]; !ok || m.session[sessionID].inputPipe == nil {
 			m.sessionMu.Unlock()
 			time.Sleep(time.Millisecond) // TODO: wait Build without busy loop and make it cancellable
 			continue
 		}
-		inputPipeW = m.session[ref].inputPipe
+		inputPipeW = m.session[sessionID].inputPipe
 		m.sessionMu.Unlock()
 		break
 	}
@@ -270,7 +341,7 @@ func (m *Server) Input(stream pb.Controller_InputServer) (err error) {
 			select {
 			case msg = <-msgCh:
 			case <-ctx.Done():
-				return errors.Wrap(ctx.Err(), "canceled")
+				return context.Cause(ctx)
 			}
 			if msg == nil {
 				return nil
@@ -293,56 +364,51 @@ func (m *Server) Input(stream pb.Controller_InputServer) (err error) {
 }
 
 func (m *Server) Invoke(srv pb.Controller_InvokeServer) error {
-	ctx, cancel := context.WithCancel(context.TODO())
-	defer cancel()
 	containerIn, containerOut := ioset.Pipe()
-	waitInvokeDoneCh := make(chan struct{})
-	var cancelOnce sync.Once
-	curInvokeCancel := func() {
-		cancelOnce.Do(func() { containerOut.Close(); containerIn.Close(); cancel() })
-		<-waitInvokeDoneCh
-	}
-	defer curInvokeCancel()
+	defer func() { containerOut.Close(); containerIn.Close() }()
 
-	var cfg *pb.ContainerConfig
-	var resultCtx *build.ResultContext
-	initDoneCh := make(chan struct{})
+	initDoneCh := make(chan *processes.Process)
 	initErrCh := make(chan error)
-	eg, egCtx := errgroup.WithContext(ctx)
+	eg, egCtx := errgroup.WithContext(context.TODO())
+	srvIOCtx, srvIOCancel := context.WithCancelCause(egCtx)
 	eg.Go(func() error {
-		return serveIO(egCtx, srv, func(initMessage *pb.InitMessage) (retErr error) {
+		defer srvIOCancel(errors.WithStack(context.Canceled))
+		return serveIO(srvIOCtx, srv, func(initMessage *pb.InitMessage) (retErr error) {
 			defer func() {
 				if retErr != nil {
 					initErrCh <- retErr
 				}
-				close(initDoneCh)
 			}()
-			ref := initMessage.Ref
-			cfg = initMessage.ContainerConfig
+			sessionID := initMessage.SessionID
+			cfg := initMessage.InvokeConfig
 
-			// Register cancel callback
 			m.sessionMu.Lock()
-			if s, ok := m.session[ref]; ok {
-				if cancel := s.curInvokeCancel; cancel != nil {
-					logrus.Warnf("invoke: cancelling ongoing invoke of %q", ref)
-					cancel()
+			s, ok := m.session[sessionID]
+			if !ok {
+				m.sessionMu.Unlock()
+				return errors.Errorf("invoke: unknown session ID %v", sessionID)
+			}
+			m.sessionMu.Unlock()
+
+			pid := initMessage.ProcessID
+			if pid == "" {
+				return errors.Errorf("invoke: specify process ID")
+			}
+			proc, ok := s.processes.Get(pid)
+			if !ok {
+				// Start a new process.
+				if cfg == nil {
+					return errors.New("no container config is provided")
 				}
-				s.curInvokeCancel = curInvokeCancel
-				m.session[ref] = s
-			} else {
-				m.sessionMu.Unlock()
-				return errors.Errorf("invoke: unknown key %v", ref)
+				var err error
+				proc, err = s.processes.StartProcess(pid, s.result, cfg)
+				if err != nil {
+					return err
+				}
 			}
-			m.sessionMu.Unlock()
-
-			// Get the target result to invoke a container from
-			m.sessionMu.Lock()
-			if _, ok := m.session[ref]; !ok || m.session[ref].result == nil {
-				m.sessionMu.Unlock()
-				return errors.Errorf("unknown reference: %q", ref)
-			}
-			resultCtx = m.session[ref].result
-			m.sessionMu.Unlock()
+			// Attach containerIn to this process
+			proc.ForwardIO(&containerIn, srvIOCancel)
+			initDoneCh <- proc
 			return nil
 		}, &ioServerConfig{
 			stdin:  containerOut.Stdin,
@@ -351,89 +417,29 @@ func (m *Server) Invoke(srv pb.Controller_InvokeServer) error {
 			// TODO: signal, resize
 		})
 	})
-	eg.Go(func() error {
-		defer containerIn.Close()
-		defer cancel()
+	eg.Go(func() (rErr error) {
+		defer srvIOCancel(errors.WithStack(context.Canceled))
+		// Wait for init done
+		var proc *processes.Process
 		select {
-		case <-initDoneCh:
+		case p := <-initDoneCh:
+			proc = p
 		case err := <-initErrCh:
 			return err
+		case <-egCtx.Done():
+			return egCtx.Err()
 		}
-		if cfg == nil {
-			return errors.New("no container config is provided")
+
+		// Wait for IO done
+		select {
+		case <-srvIOCtx.Done():
+			return srvIOCtx.Err()
+		case err := <-proc.Done():
+			return err
+		case <-egCtx.Done():
+			return egCtx.Err()
 		}
-		if resultCtx == nil {
-			return errors.New("no result is provided")
-		}
-		ccfg := build.ContainerConfig{
-			ResultCtx:  resultCtx,
-			Entrypoint: cfg.Entrypoint,
-			Cmd:        cfg.Cmd,
-			Env:        cfg.Env,
-			Tty:        cfg.Tty,
-			Stdin:      containerIn.Stdin,
-			Stdout:     containerIn.Stdout,
-			Stderr:     containerIn.Stderr,
-		}
-		if !cfg.NoUser {
-			ccfg.User = &cfg.User
-		}
-		if !cfg.NoCwd {
-			ccfg.Cwd = &cfg.Cwd
-		}
-		return build.Invoke(egCtx, ccfg)
 	})
-	err := eg.Wait()
-	close(waitInvokeDoneCh)
-	curInvokeCancel()
 
-	return err
-}
-
-func toControlStatus(s *client.SolveStatus) *pb.StatusResponse {
-	resp := pb.StatusResponse{}
-	for _, v := range s.Vertexes {
-		resp.Vertexes = append(resp.Vertexes, &controlapi.Vertex{
-			Digest:        v.Digest,
-			Inputs:        v.Inputs,
-			Name:          v.Name,
-			Started:       v.Started,
-			Completed:     v.Completed,
-			Error:         v.Error,
-			Cached:        v.Cached,
-			ProgressGroup: v.ProgressGroup,
-		})
-	}
-	for _, v := range s.Statuses {
-		resp.Statuses = append(resp.Statuses, &controlapi.VertexStatus{
-			ID:        v.ID,
-			Vertex:    v.Vertex,
-			Name:      v.Name,
-			Total:     v.Total,
-			Current:   v.Current,
-			Timestamp: v.Timestamp,
-			Started:   v.Started,
-			Completed: v.Completed,
-		})
-	}
-	for _, v := range s.Logs {
-		resp.Logs = append(resp.Logs, &controlapi.VertexLog{
-			Vertex:    v.Vertex,
-			Stream:    int64(v.Stream),
-			Msg:       v.Data,
-			Timestamp: v.Timestamp,
-		})
-	}
-	for _, v := range s.Warnings {
-		resp.Warnings = append(resp.Warnings, &controlapi.VertexWarning{
-			Vertex: v.Vertex,
-			Level:  int64(v.Level),
-			Short:  v.Short,
-			Detail: v.Detail,
-			Url:    v.URL,
-			Info:   v.SourceInfo,
-			Ranges: v.Range,
-		})
-	}
-	return &resp
+	return eg.Wait()
 }

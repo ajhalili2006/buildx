@@ -1,6 +1,6 @@
 # buildx
 
-```
+```text
 docker buildx [OPTIONS] COMMAND
 ```
 
@@ -9,23 +9,23 @@ Extended build capabilities with BuildKit
 
 ### Subcommands
 
-| Name                                           | Description                                |
-|:-----------------------------------------------|:-------------------------------------------|
-| [`_INTERNAL_SERVE`](buildx__INTERNAL_SERVE.md) |                                            |
-| [`bake`](buildx_bake.md)                       | Build from a file                          |
-| [`build`](buildx_build.md)                     | Start a build                              |
-| [`create`](buildx_create.md)                   | Create a new builder instance              |
-| [`du`](buildx_du.md)                           | Disk usage                                 |
-| [`imagetools`](buildx_imagetools.md)           | Commands to work on images in registry     |
-| [`inspect`](buildx_inspect.md)                 | Inspect current builder instance           |
-| [`install`](buildx_install.md)                 | Install buildx as a 'docker builder' alias |
-| [`ls`](buildx_ls.md)                           | List builder instances                     |
-| [`prune`](buildx_prune.md)                     | Remove build cache                         |
-| [`rm`](buildx_rm.md)                           | Remove a builder instance                  |
-| [`stop`](buildx_stop.md)                       | Stop builder instance                      |
-| [`uninstall`](buildx_uninstall.md)             | Uninstall the 'docker builder' alias       |
-| [`use`](buildx_use.md)                         | Set the current builder instance           |
-| [`version`](buildx_version.md)                 | Show buildx version information            |
+| Name                                 | Description                                     |
+|:-------------------------------------|:------------------------------------------------|
+| [`bake`](buildx_bake.md)             | Build from a file                               |
+| [`build`](buildx_build.md)           | Start a build                                   |
+| [`create`](buildx_create.md)         | Create a new builder instance                   |
+| [`debug`](buildx_debug.md)           | Start debugger (EXPERIMENTAL)                   |
+| [`dial-stdio`](buildx_dial-stdio.md) | Proxy current stdio streams to builder instance |
+| [`du`](buildx_du.md)                 | Disk usage                                      |
+| [`history`](buildx_history.md)       | Commands to work on build records               |
+| [`imagetools`](buildx_imagetools.md) | Commands to work on images in registry          |
+| [`inspect`](buildx_inspect.md)       | Inspect current builder instance                |
+| [`ls`](buildx_ls.md)                 | List builder instances                          |
+| [`prune`](buildx_prune.md)           | Remove build cache                              |
+| [`rm`](buildx_rm.md)                 | Remove one or more builder instances            |
+| [`stop`](buildx_stop.md)             | Stop builder instance                           |
+| [`use`](buildx_use.md)               | Set the current builder instance                |
+| [`version`](buildx_version.md)       | Show buildx version information                 |
 
 
 ### Options
@@ -33,6 +33,7 @@ Extended build capabilities with BuildKit
 | Name                    | Type     | Default | Description                              |
 |:------------------------|:---------|:--------|:-----------------------------------------|
 | [`--builder`](#builder) | `string` |         | Override the configured builder instance |
+| `-D`, `--debug`         | `bool`   |         | Enable debug logging                     |
 
 
 <!---MARKER_GEN_END-->

@@ -32,19 +32,6 @@ Key features:
   - [Building with buildx](#building-with-buildx)
   - [Working with builder instances](#working-with-builder-instances)
   - [Building multi-platform images](#building-multi-platform-images)
-- [Manuals](docs/manuals)
-  - [High-level build options with Bake](docs/manuals/bake/index.md)
-  - [Drivers](docs/manuals/drivers/index.md)
-  - [Exporters](docs/manuals/exporters/index.md)
-  - [Cache backends](docs/manuals/cache/backends/index.md)
-- [Guides](docs/guides)
-  - [CI/CD](docs/guides/cicd.md)
-  - [CNI networking](docs/guides/cni-networking.md)
-  - [Using a custom network](docs/guides/custom-network.md)
-  - [Using a custom registry configuration](docs/guides/custom-registry-config.md)
-  - [OpenTelemetry support](docs/guides/opentelemetry.md)
-  - [Registry mirror](docs/guides/registry-mirror.md)
-  - [Resource limiting](docs/guides/resource-limiting.md)
 - [Reference](docs/reference/buildx.md)
   - [`buildx bake`](docs/reference/buildx_bake.md)
   - [`buildx build`](docs/reference/buildx_build.md)
@@ -54,22 +41,22 @@ Key features:
     - [`buildx imagetools create`](docs/reference/buildx_imagetools_create.md)
     - [`buildx imagetools inspect`](docs/reference/buildx_imagetools_inspect.md)
   - [`buildx inspect`](docs/reference/buildx_inspect.md)
-  - [`buildx install`](docs/reference/buildx_install.md)
   - [`buildx ls`](docs/reference/buildx_ls.md)
   - [`buildx prune`](docs/reference/buildx_prune.md)
   - [`buildx rm`](docs/reference/buildx_rm.md)
   - [`buildx stop`](docs/reference/buildx_stop.md)
-  - [`buildx uninstall`](docs/reference/buildx_uninstall.md)
   - [`buildx use`](docs/reference/buildx_use.md)
   - [`buildx version`](docs/reference/buildx_version.md)
 - [Contributing](#contributing)
+
+For more information on how to use Buildx, see
+[Docker Build docs](https://docs.docker.com/build/).
 
 # Installing
 
 Using `buildx` with Docker requires Docker engine 19.03 or newer.
 
-> **Warning**
->
+> [!WARNING]
 > Using an incompatible version of Docker may result in unexpected behavior,
 > and will likely cause issues, especially when using Buildx builders with more
 > recent versions of BuildKit.
@@ -81,13 +68,13 @@ for Windows and macOS.
 
 ## Linux packages
 
-Docker Linux packages also include Docker Buildx when installed using the
-[DEB or RPM packages](https://docs.docker.com/engine/install/).
+Docker Engine package repositories contain Docker Buildx packages when installed according to the
+[Docker Engine install documentation](https://docs.docker.com/engine/install/). Install the
+`docker-buildx-plugin` package to install the Buildx plugin.
 
 ## Manual download
 
-> **Important**
->
+> [!IMPORTANT]
 > This section is for unattended installation of the buildx component. These
 > instructions are mostly suitable for testing purposes. We do not recommend
 > installing buildx using manual download in production environments as they
@@ -118,8 +105,7 @@ On Windows:
 * `C:\ProgramData\Docker\cli-plugins`
 * `C:\Program Files\Docker\cli-plugins`
 
-> **Note**
->
+> [!NOTE]
 > On Unix environments, it may also be necessary to make it executable with `chmod +x`:
 > ```shell
 > $ chmod +x ~/.docker/cli-plugins/docker-buildx
@@ -158,7 +144,7 @@ $ DOCKER_BUILDKIT=1 docker build --platform=local -o . "https://github.com/docke
 $ mkdir -p ~/.docker/cli-plugins
 $ mv buildx ~/.docker/cli-plugins/docker-buildx
 
-# Local 
+# Local
 $ git clone https://github.com/docker/buildx.git && cd buildx
 $ make install
 ```
@@ -198,12 +184,12 @@ through various "drivers". Each driver defines how and where a build should
 run, and have different feature sets.
 
 We currently support the following drivers:
-- The `docker` driver ([guide](docs/manuals/drivers/docker.md), [reference](https://docs.docker.com/engine/reference/commandline/buildx_create/#driver))
-- The `docker-container` driver ([guide](docs/manuals/drivers/docker-container.md), [reference](https://docs.docker.com/engine/reference/commandline/buildx_create/#driver))
-- The `kubernetes` driver ([guide](docs/manuals/drivers/kubernetes.md), [reference](https://docs.docker.com/engine/reference/commandline/buildx_create/#driver))
-- The `remote` driver ([guide](docs/manuals/drivers/remote.md))
+- The `docker` driver ([guide](https://docs.docker.com/build/drivers/docker/), [reference](https://docs.docker.com/engine/reference/commandline/buildx_create/#driver))
+- The `docker-container` driver ([guide](https://docs.docker.com/build/drivers/docker-container/), [reference](https://docs.docker.com/engine/reference/commandline/buildx_create/#driver))
+- The `kubernetes` driver ([guide](https://docs.docker.com/build/drivers/kubernetes/), [reference](https://docs.docker.com/engine/reference/commandline/buildx_create/#driver))
+- The `remote` driver ([guide](https://docs.docker.com/build/drivers/remote/))
 
-For more information on drivers, see the [drivers guide](docs/manuals/drivers/index.md).
+For more information on drivers, see the [drivers guide](https://docs.docker.com/build/drivers/).
 
 ## Working with builder instances
 
@@ -250,7 +236,7 @@ When you invoke a build, you can set the `--platform` flag to specify the target
 platform for the build output, (for example, `linux/amd64`, `linux/arm64`, or
 `darwin/amd64`).
 
-When the current builder instance is backed by the `docker-container` or 
+When the current builder instance is backed by the `docker-container` or
 `kubernetes` driver, you can specify multiple platforms together. In this case,
 it builds a manifest list which contains images for all specified architectures.
 When you use this image in [`docker run`](https://docs.docker.com/engine/reference/commandline/run/)
@@ -320,7 +306,7 @@ cross-compilation helpers for more advanced use-cases.
 
 ## High-level build options
 
-See [`docs/manuals/bake/index.md`](docs/manuals/bake/index.md) for more details.
+See [High-level builds with Bake](https://docs.docker.com/build/bake/) for more details.
 
 # Contributing
 

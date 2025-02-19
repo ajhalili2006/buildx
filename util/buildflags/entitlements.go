@@ -1,21 +1,24 @@
 package buildflags
 
 import (
+	"log"
+
 	"github.com/moby/buildkit/util/entitlements"
-	"github.com/pkg/errors"
 )
 
-func ParseEntitlements(in []string) ([]entitlements.Entitlement, error) {
-	out := make([]entitlements.Entitlement, 0, len(in))
+func ParseEntitlements(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	log.Printf("in: %#v", in)
 	for _, v := range in {
-		switch v {
-		case "security.insecure":
-			out = append(out, entitlements.EntitlementSecurityInsecure)
-		case "network.host":
-			out = append(out, entitlements.EntitlementNetworkHost)
-		default:
-			return nil, errors.Errorf("invalid entitlement: %v", v)
+		if v == "" {
+			continue
 		}
+
+		if _, _, err := entitlements.Parse(v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
 	}
+	log.Printf("Parsed entitlements: %v", out)
 	return out, nil
 }

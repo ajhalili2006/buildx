@@ -43,9 +43,9 @@ func serveIO(attachCtx context.Context, srv msgStream, initFn func(*pb.InitMessa
 	if init == nil {
 		return errors.Errorf("unexpected message: %T; wanted init", msg.GetInput())
 	}
-	ref := init.Ref
-	if ref == "" {
-		return errors.New("no ref is provided")
+	sessionID := init.SessionID
+	if sessionID == "" {
+		return errors.New("no session ID is provided")
 	}
 	if err := initFn(init); err != nil {
 		return errors.Wrap(err, "failed to initialize IO server")
@@ -207,6 +207,7 @@ func attachIO(ctx context.Context, stream msgStream, initMessage *pb.InitMessage
 
 	if cfg.signal != nil {
 		eg.Go(func() error {
+			names := signalNames()
 			for {
 				var sig syscall.Signal
 				select {
@@ -216,7 +217,7 @@ func attachIO(ctx context.Context, stream msgStream, initMessage *pb.InitMessage
 				case <-ctx.Done():
 					return nil
 				}
-				name := sigToName[sig]
+				name := names[sig]
 				if name == "" {
 					continue
 				}
@@ -301,7 +302,6 @@ func attachIO(ctx context.Context, stream msgStream, initMessage *pb.InitMessage
 					out = cfg.stderr
 				default:
 					return errors.Errorf("unsupported fd %d", file.Fd)
-
 				}
 				if out == nil {
 					logrus.Warnf("attachIO: no writer for fd %d", file.Fd)
@@ -344,7 +344,7 @@ func receive(ctx context.Context, stream msgStream) (*pb.Message, error) {
 	case err := <-errCh:
 		return nil, err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, context.Cause(ctx)
 	}
 }
 
@@ -358,7 +358,7 @@ func copyToStream(fd uint32, snd msgStream, r io.Reader) error {
 			}
 			return err
 		} else if n > 0 {
-			if snd.Send(&pb.Message{
+			if err := snd.Send(&pb.Message{
 				Input: &pb.Message_File{
 					File: &pb.FdMessage{
 						Fd:   fd,
@@ -380,12 +380,12 @@ func copyToStream(fd uint32, snd msgStream, r io.Reader) error {
 	})
 }
 
-var sigToName = map[syscall.Signal]string{}
-
-func init() {
+func signalNames() map[syscall.Signal]string {
+	m := make(map[syscall.Signal]string, len(signal.SignalMap))
 	for name, value := range signal.SignalMap {
-		sigToName[value] = name
+		m[value] = name
 	}
+	return m
 }
 
 type debugStream struct {

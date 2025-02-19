@@ -17,7 +17,7 @@ import (
 
 // GetStore returns current builder instance store
 func GetStore(dockerCli command.Cli) (*store.Txn, func(), error) {
-	s, err := store.New(confutil.ConfigDir(dockerCli))
+	s, err := store.New(confutil.NewConfig(dockerCli))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -61,7 +61,10 @@ func GetCurrentInstance(txn *store.Txn, dockerCli command.Cli) (*store.NodeGroup
 		return nil, err
 	}
 	if ng == nil {
-		ng, _ = GetNodeGroup(txn, dockerCli, dockerCli.CurrentContext())
+		ng, err = GetNodeGroup(txn, dockerCli, dockerCli.CurrentContext())
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return ng, nil
@@ -71,7 +74,7 @@ func GetCurrentInstance(txn *store.Txn, dockerCli command.Cli) (*store.NodeGroup
 func GetNodeGroup(txn *store.Txn, dockerCli command.Cli, name string) (*store.NodeGroup, error) {
 	ng, err := txn.NodeGroupByName(name)
 	if err != nil {
-		if !os.IsNotExist(errors.Cause(err)) {
+		if !os.IsNotExist(errors.Cause(err)) && !store.IsErrInvalidName(err) {
 			return nil, err
 		}
 	}

@@ -1,6 +1,6 @@
 # buildx imagetools
 
-```
+```text
 docker buildx imagetools [OPTIONS] COMMAND
 ```
 
@@ -20,14 +20,16 @@ Commands to work on images in registry
 | Name                    | Type     | Default | Description                              |
 |:------------------------|:---------|:--------|:-----------------------------------------|
 | [`--builder`](#builder) | `string` |         | Override the configured builder instance |
+| `-D`, `--debug`         | `bool`   |         | Enable debug logging                     |
 
 
 <!---MARKER_GEN_END-->
 
 ## Description
 
-Imagetools contains commands for working with manifest lists in the registry.
-These commands are useful for inspecting multi-platform build results.
+The `imagetools` commands contains subcommands for working with manifest lists
+in container registries. These commands are useful for inspecting manifests
+to check multi-platform configuration and attestations.
 
 ## Examples
 

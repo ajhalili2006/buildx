@@ -4,6 +4,7 @@ import (
 	"os"
 
 	"github.com/docker/buildx/util/cobrautil"
+	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/config"
@@ -14,7 +15,7 @@ import (
 type uninstallOptions struct {
 }
 
-func runUninstall(dockerCli command.Cli, in uninstallOptions) error {
+func runUninstall(_ command.Cli, _ uninstallOptions) error {
 	dir := config.Dir()
 	cfg, err := config.Load(dir)
 	if err != nil {
@@ -52,7 +53,8 @@ func uninstallCmd(dockerCli command.Cli) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runUninstall(dockerCli, options)
 		},
-		Hidden: true,
+		Hidden:            true,
+		ValidArgsFunction: completion.Disable,
 	}
 
 	// hide builder persistent flag for this command

@@ -5,7 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/buildx/util/confutil"
 	"github.com/pkg/errors"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -15,12 +17,12 @@ func TestEmptyStartup(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpdir)
 
-	s, err := New(tmpdir)
+	s, err := New(confutil.NewConfig(nil, confutil.WithDir(tmpdir)))
 	require.NoError(t, err)
 
-	txn, close, err := s.Txn()
+	txn, release, err := s.Txn()
 	require.NoError(t, err)
-	defer close()
+	defer release()
 
 	ng, err := txn.Current("foo")
 	require.NoError(t, err)
@@ -33,7 +35,7 @@ func TestNodeLocking(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpdir)
 
-	s, err := New(tmpdir)
+	s, err := New(confutil.NewConfig(nil, confutil.WithDir(tmpdir)))
 	require.NoError(t, err)
 
 	_, release, err := s.Txn()
@@ -43,7 +45,7 @@ func TestNodeLocking(t *testing.T) {
 
 	go func() {
 		_, release, err := s.Txn()
-		require.NoError(t, err)
+		assert.NoError(t, err)
 		release()
 		close(ready)
 	}()
@@ -68,7 +70,7 @@ func TestNodeManagement(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpdir)
 
-	s, err := New(tmpdir)
+	s, err := New(confutil.NewConfig(nil, confutil.WithDir(tmpdir)))
 	require.NoError(t, err)
 
 	txn, release, err := s.Txn()
@@ -234,4 +236,27 @@ func TestNodeManagement(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, ng)
 	require.Equal(t, "mybuild", ng.Name)
+}
+
+func TestNodeInvalidName(t *testing.T) {
+	t.Parallel()
+	tmpdir := t.TempDir()
+
+	s, err := New(confutil.NewConfig(nil, confutil.WithDir(tmpdir)))
+	require.NoError(t, err)
+
+	txn, release, err := s.Txn()
+	require.NoError(t, err)
+	defer release()
+
+	_, err = txn.NodeGroupByName("123builder")
+	require.Error(t, err)
+	require.True(t, IsErrInvalidName(err))
+
+	err = txn.Save(&NodeGroup{
+		Name:   "123builder",
+		Driver: "mydriver",
+	})
+	require.Error(t, err)
+	require.True(t, IsErrInvalidName(err))
 }

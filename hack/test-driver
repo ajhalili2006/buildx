@@ -49,15 +49,19 @@ if [ "$DRIVER" != "docker" ]; then
     for platform in ${PLATFORMS//,/ }; do
       createFlags=""
       if [ -f "$BUILDKIT_CFG" ]; then
-        createFlags="$createFlags --config=${BUILDKIT_CFG}"
+        createFlags="$createFlags --buildkitd-config=${BUILDKIT_CFG}"
       fi
       if [ "$firstNode" = "0" ]; then
         createFlags="$createFlags --append"
       fi
+      nodeName=""
+      if [ "$DRIVER" != "kubernetes" ]; then
+        nodeName="${builderName}-${platform/\//-}"
+      fi
       buildxCmd create ${createFlags} \
         --bootstrap \
         --name="${builderName}" \
-        --node="${builderName}-${platform/\//-}" \
+        --node="${nodeName}" \
         --platform="${platform}" \
         --driver="${DRIVER}" \
         ${driverOpt:+"--driver-opt=${driverOpt}"} \
@@ -67,7 +71,7 @@ if [ "$DRIVER" != "docker" ]; then
   else
     createFlags=""
     if [ -f "$BUILDKIT_CFG" ]; then
-      createFlags="$createFlags --config=${BUILDKIT_CFG}"
+      createFlags="$createFlags --buildkitd-config=${BUILDKIT_CFG}"
     fi
     buildxCmd create ${createFlags} \
       --bootstrap \
@@ -105,21 +109,21 @@ buildxCmd inspect --bootstrap --builder="${builderName}"
 
 # create dockerfile
 cat > "${dockerfile}" <<EOL
-FROM busybox as build
+fRom busybox as build
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 RUN echo "I am running on \$BUILDPLATFORM, building for \$TARGETPLATFORM" > /log
 
-FROM busybox AS log
+FROM busybox As log
 COPY --from=build /log /log
 RUN cat /log
 RUN uname -a
 
-FROM busybox AS hello
+FROm busybox AS hello
 RUN echo hello > /hello
 
 FROM scratch
-COPY --from=log /log /log
+CoPY --from=log /log /log
 COPY --from=hello /hello /hello
 EOL
 
@@ -163,7 +167,8 @@ buildxCmd bake ${bakePlatformFlag} \
   --file="${bakedef}" \
   --builder="${builderName}" \
   --set "*.context=${context}" \
-  --metadata-file="${context}/metadata-bake-def.json"
+  --metadata-file="${context}/metadata-bake-def.json" \
+  --allow fs="${context}"
 cat "${context}/metadata-bake-def.json"
 
 # bake all target
@@ -171,6 +176,7 @@ buildxCmd bake ${bakePlatformFlag} \
   --file="${bakedef}" \
   --builder="${builderName}" \
   --set "*.context=${context}" \
+  --allow fs="${context}" \
   --metadata-file="${context}/metadata-bake-all.json" \
   all
 cat "${context}/metadata-bake-all.json"

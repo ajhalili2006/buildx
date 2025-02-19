@@ -9,16 +9,27 @@ import (
 	"strings"
 
 	"github.com/docker/buildx/util/gitutil"
+	"github.com/docker/buildx/util/osutil"
+	"github.com/moby/buildkit/client"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
 const DockerfileLabel = "com.docker.image.source.entrypoint"
 
-func getGitAttributes(ctx context.Context, contextPath string, dockerfilePath string) (res map[string]string, _ error) {
-	res = make(map[string]string)
+type gitAttrsAppendFunc func(so *client.SolveOpt)
+
+func gitAppendNoneFunc(_ *client.SolveOpt) {}
+
+func getGitAttributes(ctx context.Context, contextPath, dockerfilePath string) (f gitAttrsAppendFunc, err error) {
+	defer func() {
+		if f == nil {
+			f = gitAppendNoneFunc
+		}
+	}()
+
 	if contextPath == "" {
-		return
+		return nil, nil
 	}
 
 	setGitLabels := false
@@ -37,7 +48,7 @@ func getGitAttributes(ctx context.Context, contextPath string, dockerfilePath st
 	}
 
 	if !setGitLabels && !setGitInfo {
-		return
+		return nil, nil
 	}
 
 	// figure out in which directory the git command needs to run in
@@ -45,29 +56,42 @@ func getGitAttributes(ctx context.Context, contextPath string, dockerfilePath st
 	if filepath.IsAbs(contextPath) {
 		wd = contextPath
 	} else {
-		cwd, _ := os.Getwd()
-		wd, _ = filepath.Abs(filepath.Join(cwd, contextPath))
+		wd, _ = filepath.Abs(filepath.Join(osutil.GetWd(), contextPath))
 	}
+	wd = osutil.SanitizePath(wd)
 
 	gitc, err := gitutil.New(gitutil.WithContext(ctx), gitutil.WithWorkingDir(wd))
 	if err != nil {
-		if st, err := os.Stat(path.Join(wd, ".git")); err == nil && st.IsDir() {
-			return res, errors.New("buildx: git was not found in the system. Current commit information was not captured by the build")
+		if st, err1 := os.Stat(path.Join(wd, ".git")); err1 == nil && st.IsDir() {
+			return nil, errors.Wrap(err, "git was not found in the system")
 		}
-		return
+		return nil, nil
 	}
 
 	if !gitc.IsInsideWorkTree() {
 		if st, err := os.Stat(path.Join(wd, ".git")); err == nil && st.IsDir() {
-			return res, errors.New("buildx: failed to read current commit information with git rev-parse --is-inside-work-tree")
+			return nil, errors.New("failed to read current commit information with git rev-parse --is-inside-work-tree")
 		}
-		return res, nil
+		return nil, nil
 	}
 
+	root, err := gitc.RootDir()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get git root dir")
+	}
+
+	res := make(map[string]string)
+
 	if sha, err := gitc.FullCommit(); err != nil && !gitutil.IsUnknownRevision(err) {
-		return res, errors.Wrapf(err, "buildx: failed to get git commit")
+		return nil, errors.Wrap(err, "failed to get git commit")
 	} else if sha != "" {
-		if gitc.IsDirty() {
+		checkDirty := false
+		if v, ok := os.LookupEnv("BUILDX_GIT_CHECK_DIRTY"); ok {
+			if v, err := strconv.ParseBool(v); err == nil {
+				checkDirty = v
+			}
+		}
+		if checkDirty && gitc.IsDirty() {
 			sha += "-dirty"
 		}
 		if setGitLabels {
@@ -87,23 +111,50 @@ func getGitAttributes(ctx context.Context, contextPath string, dockerfilePath st
 		}
 	}
 
-	if setGitLabels {
-		if root, err := gitc.RootDir(); err != nil {
-			return res, errors.Wrapf(err, "buildx: failed to get git root dir")
-		} else if root != "" {
-			if dockerfilePath == "" {
-				dockerfilePath = filepath.Join(wd, "Dockerfile")
-			}
-			if !filepath.IsAbs(dockerfilePath) {
-				cwd, _ := os.Getwd()
-				dockerfilePath = filepath.Join(cwd, dockerfilePath)
-			}
-			dockerfilePath, _ = filepath.Rel(root, dockerfilePath)
-			if !strings.HasPrefix(dockerfilePath, "..") {
-				res["label:"+DockerfileLabel] = dockerfilePath
-			}
+	if setGitLabels && root != "" {
+		if dockerfilePath == "" {
+			dockerfilePath = filepath.Join(wd, "Dockerfile")
+		}
+		if !filepath.IsAbs(dockerfilePath) {
+			dockerfilePath = filepath.Join(osutil.GetWd(), dockerfilePath)
+		}
+		if r, err := filepath.Rel(root, dockerfilePath); err == nil && !strings.HasPrefix(r, "..") {
+			res["label:"+DockerfileLabel] = r
 		}
 	}
 
-	return
+	return func(so *client.SolveOpt) {
+		if so.FrontendAttrs == nil {
+			so.FrontendAttrs = make(map[string]string)
+		}
+		for k, v := range res {
+			so.FrontendAttrs[k] = v
+		}
+
+		if !setGitInfo || root == "" {
+			return
+		}
+
+		for key, mount := range so.LocalMounts {
+			fs, ok := mount.(*fs)
+			if !ok {
+				continue
+			}
+			dir, err := filepath.EvalSymlinks(fs.dir) // keep same behavior as fsutil.NewFS
+			if err != nil {
+				continue
+			}
+			dir, err = filepath.Abs(dir)
+			if err != nil {
+				continue
+			}
+			if lp, err := osutil.GetLongPathName(dir); err == nil {
+				dir = lp
+			}
+			dir = osutil.SanitizePath(dir)
+			if r, err := filepath.Rel(root, dir); err == nil && !strings.HasPrefix(r, "..") {
+				so.FrontendAttrs["vcs:localdir:"+key] = r
+			}
+		}
+	}, nil
 }

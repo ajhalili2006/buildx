@@ -1,13 +1,18 @@
+// FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
+//go:build go1.22
+
 package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/atomicwriter"
 	"github.com/fvbommel/sortorder"
 	"github.com/pkg/errors"
 )
@@ -35,15 +40,15 @@ func (s *metadataStore) createOrUpdate(meta Metadata) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(contextDir, metaFile), bytes, 0o644)
+	return atomicwriter.WriteFile(filepath.Join(contextDir, metaFile), bytes, 0o644)
 }
 
-func parseTypedOrMap(payload []byte, getter TypeGetter) (interface{}, error) {
+func parseTypedOrMap(payload []byte, getter TypeGetter) (any, error) {
 	if len(payload) == 0 || string(payload) == "null" {
 		return nil, nil
 	}
 	if getter == nil {
-		var res map[string]interface{}
+		var res map[string]any
 		if err := json.Unmarshal(payload, &res); err != nil {
 			return nil, err
 		}
@@ -65,7 +70,8 @@ func (s *metadataStore) get(name string) (Metadata, error) {
 }
 
 func (s *metadataStore) getByID(id contextdir) (Metadata, error) {
-	bytes, err := os.ReadFile(filepath.Join(s.contextDir(id), metaFile))
+	fileName := filepath.Join(s.contextDir(id), metaFile)
+	bytes, err := os.ReadFile(fileName)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return Metadata{}, errdefs.NotFound(errors.Wrap(err, "context not found"))
@@ -74,18 +80,18 @@ func (s *metadataStore) getByID(id contextdir) (Metadata, error) {
 	}
 	var untyped untypedContextMetadata
 	r := Metadata{
-		Endpoints: make(map[string]interface{}),
+		Endpoints: make(map[string]any),
 	}
 	if err := json.Unmarshal(bytes, &untyped); err != nil {
-		return Metadata{}, err
+		return Metadata{}, fmt.Errorf("parsing %s: %v", fileName, err)
 	}
 	r.Name = untyped.Name
 	if r.Metadata, err = parseTypedOrMap(untyped.Metadata, s.config.contextType); err != nil {
-		return Metadata{}, err
+		return Metadata{}, fmt.Errorf("parsing %s: %v", fileName, err)
 	}
 	for k, v := range untyped.Endpoints {
 		if r.Endpoints[k], err = parseTypedOrMap(v, s.config.endpointTypes[k]); err != nil {
-			return Metadata{}, err
+			return Metadata{}, fmt.Errorf("parsing %s: %v", fileName, err)
 		}
 	}
 	return r, err
@@ -106,7 +112,7 @@ func (s *metadataStore) list() ([]Metadata, error) {
 		}
 		return nil, err
 	}
-	var res []Metadata
+	res := make([]Metadata, 0, len(ctxDirs))
 	for _, dir := range ctxDirs {
 		c, err := s.getByID(contextdir(dir))
 		if err != nil {

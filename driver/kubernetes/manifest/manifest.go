@@ -14,10 +14,12 @@ import (
 )
 
 type DeploymentOpt struct {
-	Namespace string
-	Name      string
-	Image     string
-	Replicas  int
+	Namespace          string
+	Name               string
+	Image              string
+	Replicas           int
+	ServiceAccountName string
+	SchedulerName      string
 
 	// Qemu
 	Qemu struct {
@@ -30,24 +32,41 @@ type DeploymentOpt struct {
 	// files mounted at /etc/buildkitd
 	ConfigFiles map[string][]byte
 
-	Rootless       bool
-	NodeSelector   map[string]string
-	Tolerations    []corev1.Toleration
-	RequestsCPU    string
-	RequestsMemory string
-	LimitsCPU      string
-	LimitsMemory   string
-	Platforms      []v1.Platform
+	Rootless                 bool
+	NodeSelector             map[string]string
+	CustomAnnotations        map[string]string
+	CustomLabels             map[string]string
+	Tolerations              []corev1.Toleration
+	RequestsCPU              string
+	RequestsMemory           string
+	RequestsEphemeralStorage string
+	LimitsCPU                string
+	LimitsMemory             string
+	LimitsEphemeralStorage   string
+	Platforms                []v1.Platform
 }
 
 const (
 	containerName      = "buildkitd"
 	AnnotationPlatform = "buildx.docker.com/platform"
+	LabelApp           = "app"
 )
+
+type ErrReservedAnnotationPlatform struct{}
+
+func (ErrReservedAnnotationPlatform) Error() string {
+	return fmt.Sprintf("the annotation %q is reserved and cannot be customized", AnnotationPlatform)
+}
+
+type ErrReservedLabelApp struct{}
+
+func (ErrReservedLabelApp) Error() string {
+	return fmt.Sprintf("the label %q is reserved and cannot be customized", LabelApp)
+}
 
 func NewDeployment(opt *DeploymentOpt) (d *appsv1.Deployment, c []*corev1.ConfigMap, err error) {
 	labels := map[string]string{
-		"app": opt.Name,
+		LabelApp: opt.Name,
 	}
 	annotations := map[string]string{}
 	replicas := int32(opt.Replicas)
@@ -56,6 +75,20 @@ func NewDeployment(opt *DeploymentOpt) (d *appsv1.Deployment, c []*corev1.Config
 
 	if len(opt.Platforms) > 0 {
 		annotations[AnnotationPlatform] = strings.Join(platformutil.Format(opt.Platforms), ",")
+	}
+
+	for k, v := range opt.CustomAnnotations {
+		if k == AnnotationPlatform {
+			return nil, nil, ErrReservedAnnotationPlatform{}
+		}
+		annotations[k] = v
+	}
+
+	for k, v := range opt.CustomLabels {
+		if k == LabelApp {
+			return nil, nil, ErrReservedLabelApp{}
+		}
+		labels[k] = v
 	}
 
 	d = &appsv1.Deployment{
@@ -80,6 +113,8 @@ func NewDeployment(opt *DeploymentOpt) (d *appsv1.Deployment, c []*corev1.Config
 					Annotations: annotations,
 				},
 				Spec: corev1.PodSpec{
+					ServiceAccountName: opt.ServiceAccountName,
+					SchedulerName:      opt.SchedulerName,
 					Containers: []corev1.Container{
 						{
 							Name:  containerName,
@@ -89,7 +124,7 @@ func NewDeployment(opt *DeploymentOpt) (d *appsv1.Deployment, c []*corev1.Config
 								Privileged: &privileged,
 							},
 							ReadinessProbe: &corev1.Probe{
-								Handler: corev1.Handler{
+								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
 										Command: []string{"buildctl", "debug", "workers"},
 									},
@@ -119,13 +154,13 @@ func NewDeployment(opt *DeploymentOpt) (d *appsv1.Deployment, c []*corev1.Config
 			Data: cfg.files,
 		}
 
-		d.Spec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
+		d.Spec.Template.Spec.Containers[0].VolumeMounts = append(d.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
 			Name:      cfg.name,
 			MountPath: path.Join("/etc/buildkit", cfg.path),
-		}}
+		})
 
-		d.Spec.Template.Spec.Volumes = []corev1.Volume{{
-			Name: "config",
+		d.Spec.Template.Spec.Volumes = append(d.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: cfg.name,
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{
@@ -133,7 +168,7 @@ func NewDeployment(opt *DeploymentOpt) (d *appsv1.Deployment, c []*corev1.Config
 					},
 				},
 			},
-		}}
+		})
 		c = append(c, cc)
 	}
 
@@ -180,6 +215,14 @@ func NewDeployment(opt *DeploymentOpt) (d *appsv1.Deployment, c []*corev1.Config
 		d.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory] = reqMemory
 	}
 
+	if opt.RequestsEphemeralStorage != "" {
+		reqEphemeralStorage, err := resource.ParseQuantity(opt.RequestsEphemeralStorage)
+		if err != nil {
+			return nil, nil, err
+		}
+		d.Spec.Template.Spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage] = reqEphemeralStorage
+	}
+
 	if opt.LimitsCPU != "" {
 		limCPU, err := resource.ParseQuantity(opt.LimitsCPU)
 		if err != nil {
@@ -194,6 +237,14 @@ func NewDeployment(opt *DeploymentOpt) (d *appsv1.Deployment, c []*corev1.Config
 			return nil, nil, err
 		}
 		d.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory] = limMemory
+	}
+
+	if opt.LimitsEphemeralStorage != "" {
+		limEphemeralStorage, err := resource.ParseQuantity(opt.LimitsEphemeralStorage)
+		if err != nil {
+			return nil, nil, err
+		}
+		d.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage] = limEphemeralStorage
 	}
 
 	return

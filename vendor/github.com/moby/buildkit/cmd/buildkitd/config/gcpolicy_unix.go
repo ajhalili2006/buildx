@@ -1,18 +1,11 @@
 //go:build !windows
-// +build !windows
 
 package config
 
-import (
-	"syscall"
+const (
+	DiskSpaceReservePercentage int64 = 10
+	DiskSpaceReserveBytes      int64 = 10 * 1e9 // 10GB
+	DiskSpaceFreePercentage    int64 = 20
+	DiskSpaceMaxPercentage     int64 = 80
+	DiskSpaceMaxBytes          int64 = 100 * 1e9 // 100GB
 )
-
-func DetectDefaultGCCap(root string) int64 {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(root, &st); err != nil {
-		return defaultCap
-	}
-	diskSize := int64(st.Bsize) * int64(st.Blocks)
-	avail := diskSize / 10
-	return (avail/(1<<30) + 1) * 1e9 // round up
-}

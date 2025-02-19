@@ -6,13 +6,13 @@ import (
 	"sort"
 	"testing"
 
-	compose "github.com/compose-spec/compose-go/types"
+	composetypes "github.com/compose-spec/compose-go/v2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestParseCompose(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   db:
     build: ./db
@@ -21,6 +21,8 @@ services:
   webapp:
     build:
       context: ./dir
+      additional_contexts:
+        foo: ./bar
       dockerfile: Dockerfile-alternate
       network:
         none
@@ -30,9 +32,19 @@ services:
         - type=local,src=path/to/cache
       cache_to:
         - type=local,dest=path/to/cache
+      ssh:
+        - key=/path/to/key
+        - default
       secrets:
         - token
         - aws
+  webapp2:
+    profiles:
+      - test
+    build:
+      context: ./dir
+      dockerfile_inline: |
+        FROM alpine
 secrets:
   token:
     environment: ENV_TOKEN
@@ -40,52 +52,58 @@ secrets:
     file: /root/.aws/credentials
 `)
 
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, 1, len(c.Groups))
 	require.Equal(t, "default", c.Groups[0].Name)
 	sort.Strings(c.Groups[0].Targets)
-	require.Equal(t, []string{"db", "webapp"}, c.Groups[0].Targets)
+	require.Equal(t, []string{"db", "webapp", "webapp2"}, c.Groups[0].Targets)
 
-	require.Equal(t, 2, len(c.Targets))
+	require.Equal(t, 3, len(c.Targets))
 	sort.Slice(c.Targets, func(i, j int) bool {
 		return c.Targets[i].Name < c.Targets[j].Name
 	})
 	require.Equal(t, "db", c.Targets[0].Name)
-	require.Equal(t, "./db", *c.Targets[0].Context)
+	require.Equal(t, "db", *c.Targets[0].Context)
 	require.Equal(t, []string{"docker.io/tonistiigi/db"}, c.Targets[0].Tags)
 
 	require.Equal(t, "webapp", c.Targets[1].Name)
-	require.Equal(t, "./dir", *c.Targets[1].Context)
+	require.Equal(t, "dir", *c.Targets[1].Context)
+	require.Equal(t, map[string]string{"foo": "bar"}, c.Targets[1].Contexts)
 	require.Equal(t, "Dockerfile-alternate", *c.Targets[1].Dockerfile)
 	require.Equal(t, 1, len(c.Targets[1].Args))
 	require.Equal(t, ptrstr("123"), c.Targets[1].Args["buildno"])
-	require.Equal(t, []string{"type=local,src=path/to/cache"}, c.Targets[1].CacheFrom)
-	require.Equal(t, []string{"type=local,dest=path/to/cache"}, c.Targets[1].CacheTo)
+	require.Equal(t, []string{"type=local,src=path/to/cache"}, stringify(c.Targets[1].CacheFrom))
+	require.Equal(t, []string{"type=local,dest=path/to/cache"}, stringify(c.Targets[1].CacheTo))
 	require.Equal(t, "none", *c.Targets[1].NetworkMode)
+	require.Equal(t, []string{"default", "key=/path/to/key"}, stringify(c.Targets[1].SSH))
 	require.Equal(t, []string{
-		"id=token,env=ENV_TOKEN",
 		"id=aws,src=/root/.aws/credentials",
-	}, c.Targets[1].Secrets)
+		"id=token,env=ENV_TOKEN",
+	}, stringify(c.Targets[1].Secrets))
+
+	require.Equal(t, "webapp2", c.Targets[2].Name)
+	require.Equal(t, "dir", *c.Targets[2].Context)
+	require.Equal(t, "FROM alpine\n", *c.Targets[2].DockerfileInline)
 }
 
 func TestNoBuildOutOfTreeService(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
     external:
         image: "verycooldb:1337"
     webapp:
         build: ./db
 `)
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(c.Groups))
 	require.Equal(t, 1, len(c.Targets))
 }
 
 func TestParseComposeTarget(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   db:
     build:
@@ -97,7 +115,7 @@ services:
       target: webapp
 `)
 
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 
 	require.Equal(t, 2, len(c.Targets))
@@ -111,7 +129,7 @@ services:
 }
 
 func TestComposeBuildWithoutContext(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   db:
     build:
@@ -122,7 +140,7 @@ services:
       target: webapp
 `)
 
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(c.Targets))
 	sort.Slice(c.Targets, func(i, j int) bool {
@@ -135,7 +153,7 @@ services:
 }
 
 func TestBuildArgEnvCompose(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 version: "3.8"
 services:
   example:
@@ -153,7 +171,7 @@ services:
 	t.Setenv("BAR", "foo")
 	t.Setenv("ZZZ_BAR", "zzz_foo")
 
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, sliceToMap(os.Environ()))
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, sliceToMap(os.Environ()))
 	require.NoError(t, err)
 	require.Equal(t, ptrstr("bar"), c.Targets[0].Args["FOO"])
 	require.Equal(t, ptrstr("zzz_foo"), c.Targets[0].Args["BAR"])
@@ -161,18 +179,18 @@ services:
 }
 
 func TestInconsistentComposeFile(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   webapp:
     entrypoint: echo 1
 `)
 
-	_, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	_, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.Error(t, err)
 }
 
 func TestAdvancedNetwork(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   db:
     networks:
@@ -192,12 +210,12 @@ networks:
           gateway: 10.5.0.254
 `)
 
-	_, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	_, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 }
 
 func TestTags(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   example:
     image: example
@@ -209,13 +227,13 @@ services:
         - bar
 `)
 
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, []string{"foo", "bar"}, c.Targets[0].Tags)
 }
 
 func TestDependsOnList(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 version: "3.8"
 
 services:
@@ -246,12 +264,12 @@ networks:
     name: test-net
 `)
 
-	_, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	_, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 }
 
 func TestComposeExt(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   addon:
     image: ct-addon:bar
@@ -264,6 +282,8 @@ services:
         - user/app:cache
       tags:
         - ct-addon:baz
+      ssh:
+        key: /path/to/key
       args:
         CT_ECR: foo
         CT_TAG: bar
@@ -273,6 +293,9 @@ services:
         tags:
           - ct-addon:foo
           - ct-addon:alp
+        ssh:
+          - default
+          - other=path/to/otherkey
         platforms:
           - linux/amd64
           - linux/arm64
@@ -289,6 +312,11 @@ services:
       args:
         CT_ECR: foo
         CT_TAG: bar
+      shm_size: 128m
+      ulimits:
+        nofile:
+          soft: 1024
+          hard: 1024
       x-bake:
         secret:
           - id=mysecret,src=/local/secret
@@ -299,7 +327,7 @@ services:
         no-cache: true
 `)
 
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(c.Targets))
 	sort.Slice(c.Targets, func(i, j int) bool {
@@ -308,20 +336,23 @@ services:
 	require.Equal(t, map[string]*string{"CT_ECR": ptrstr("foo"), "CT_TAG": ptrstr("bar")}, c.Targets[0].Args)
 	require.Equal(t, []string{"ct-addon:baz", "ct-addon:foo", "ct-addon:alp"}, c.Targets[0].Tags)
 	require.Equal(t, []string{"linux/amd64", "linux/arm64"}, c.Targets[0].Platforms)
-	require.Equal(t, []string{"user/app:cache", "type=local,src=path/to/cache"}, c.Targets[0].CacheFrom)
-	require.Equal(t, []string{"user/app:cache", "type=local,dest=path/to/cache"}, c.Targets[0].CacheTo)
+	require.Equal(t, []string{"type=local,src=path/to/cache", "user/app:cache"}, stringify(c.Targets[0].CacheFrom))
+	require.Equal(t, []string{"type=local,dest=path/to/cache", "user/app:cache"}, stringify(c.Targets[0].CacheTo))
+	require.Equal(t, []string{"default", "key=/path/to/key", "other=path/to/otherkey"}, stringify(c.Targets[0].SSH))
 	require.Equal(t, newBool(true), c.Targets[0].Pull)
 	require.Equal(t, map[string]string{"alpine": "docker-image://alpine:3.13"}, c.Targets[0].Contexts)
 	require.Equal(t, []string{"ct-fake-aws:bar"}, c.Targets[1].Tags)
-	require.Equal(t, []string{"id=mysecret,src=/local/secret", "id=mysecret2,src=/local/secret2"}, c.Targets[1].Secrets)
-	require.Equal(t, []string{"default"}, c.Targets[1].SSH)
+	require.Equal(t, []string{"id=mysecret,src=/local/secret", "id=mysecret2,src=/local/secret2"}, stringify(c.Targets[1].Secrets))
+	require.Equal(t, []string{"default"}, stringify(c.Targets[1].SSH))
 	require.Equal(t, []string{"linux/arm64"}, c.Targets[1].Platforms)
-	require.Equal(t, []string{"type=docker"}, c.Targets[1].Outputs)
+	require.Equal(t, []string{"type=docker"}, stringify(c.Targets[1].Outputs))
 	require.Equal(t, newBool(true), c.Targets[1].NoCache)
+	require.Equal(t, ptrstr("128MiB"), c.Targets[1].ShmSize)
+	require.Equal(t, []string{"nofile=1024:1024"}, c.Targets[1].Ulimits)
 }
 
 func TestComposeExtDedup(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   webapp:
     image: app:bar
@@ -332,6 +363,8 @@ services:
         - user/app:cache
       tags:
         - ct-addon:foo
+      ssh:
+        - default
       x-bake:
         tags:
           - ct-addon:foo
@@ -341,14 +374,18 @@ services:
           - type=local,src=path/to/cache
         cache-to:
           - type=local,dest=path/to/cache
+        ssh:
+          - default
+          - key=path/to/key
 `)
 
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, 1, len(c.Targets))
 	require.Equal(t, []string{"ct-addon:foo", "ct-addon:baz"}, c.Targets[0].Tags)
-	require.Equal(t, []string{"user/app:cache", "type=local,src=path/to/cache"}, c.Targets[0].CacheFrom)
-	require.Equal(t, []string{"user/app:cache", "type=local,dest=path/to/cache"}, c.Targets[0].CacheTo)
+	require.Equal(t, []string{"type=local,src=path/to/cache", "user/app:cache"}, stringify(c.Targets[0].CacheFrom))
+	require.Equal(t, []string{"type=local,dest=path/to/cache", "user/app:cache"}, stringify(c.Targets[0].CacheTo))
+	require.Equal(t, []string{"default", "key=path/to/key"}, stringify(c.Targets[0].SSH))
 }
 
 func TestEnv(t *testing.T) {
@@ -359,7 +396,7 @@ func TestEnv(t *testing.T) {
 	_, err = envf.WriteString("FOO=bsdf -csdf\n")
 	require.NoError(t, err)
 
-	var dt = []byte(`
+	dt := []byte(`
 services:
   scratch:
     build:
@@ -376,7 +413,7 @@ services:
       - ` + envf.Name() + `
 `)
 
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, map[string]*string{"CT_ECR": ptrstr("foo"), "FOO": ptrstr("bsdf -csdf"), "NODE_ENV": ptrstr("test")}, c.Targets[0].Args)
 }
@@ -387,7 +424,7 @@ func TestDotEnv(t *testing.T) {
 	err := os.WriteFile(filepath.Join(tmpdir, ".env"), []byte("FOO=bar"), 0644)
 	require.NoError(t, err)
 
-	var dt = []byte(`
+	dt := []byte(`
 services:
   scratch:
     build:
@@ -406,7 +443,7 @@ services:
 }
 
 func TestPorts(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   foo:
     build:
@@ -422,7 +459,7 @@ services:
         published: "3306"
         protocol: tcp
 `)
-	_, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	_, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 }
 
@@ -468,7 +505,7 @@ func TestServiceName(t *testing.T) {
 	for _, tt := range cases {
 		tt := tt
 		t.Run(tt.svc, func(t *testing.T) {
-			_, err := ParseCompose([]compose.ConfigFile{{Content: []byte(`
+			_, err := ParseCompose([]composetypes.ConfigFile{{Content: []byte(`
 services:
   ` + tt.svc + `:
     build:
@@ -539,7 +576,7 @@ services:
 	for _, tt := range cases {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := ParseCompose([]compose.ConfigFile{{Content: tt.dt}}, nil)
+			_, err := ParseCompose([]composetypes.ConfigFile{{Content: tt.dt}}, nil)
 			if tt.wantErr {
 				require.Error(t, err)
 			} else {
@@ -627,7 +664,7 @@ target "default" {
 }
 
 func TestComposeNullArgs(t *testing.T) {
-	var dt = []byte(`
+	dt := []byte(`
 services:
   scratch:
     build:
@@ -637,9 +674,128 @@ services:
         bar: "baz"
 `)
 
-	c, err := ParseCompose([]compose.ConfigFile{{Content: dt}}, nil)
+	c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
 	require.NoError(t, err)
 	require.Equal(t, map[string]*string{"bar": ptrstr("baz")}, c.Targets[0].Args)
+}
+
+func TestDependsOn(t *testing.T) {
+	dt := []byte(`
+services:
+  foo:
+    build:
+     context: .
+    ports:
+      - 3306:3306
+    depends_on:
+      - bar
+  bar:
+    build:
+     context: .
+`)
+	_, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
+	require.NoError(t, err)
+}
+
+func TestInclude(t *testing.T) {
+	tmpdir := t.TempDir()
+
+	err := os.WriteFile(filepath.Join(tmpdir, "compose-foo.yml"), []byte(`
+services:
+  foo:
+    build:
+     context: .
+     target: buildfoo
+    ports:
+      - 3306:3306
+`), 0644)
+	require.NoError(t, err)
+
+	dt := []byte(`
+include:
+  - compose-foo.yml
+
+services:
+  bar:
+    build:
+     context: .
+     target: buildbar
+`)
+
+	chdir(t, tmpdir)
+	c, err := ParseComposeFiles([]File{{
+		Name: "composetypes.yml",
+		Data: dt,
+	}})
+	require.NoError(t, err)
+
+	require.Equal(t, 2, len(c.Targets))
+	sort.Slice(c.Targets, func(i, j int) bool {
+		return c.Targets[i].Name < c.Targets[j].Name
+	})
+	require.Equal(t, "bar", c.Targets[0].Name)
+	require.Equal(t, "buildbar", *c.Targets[0].Target)
+	require.Equal(t, "foo", c.Targets[1].Name)
+	require.Equal(t, "buildfoo", *c.Targets[1].Target)
+}
+
+func TestDevelop(t *testing.T) {
+	dt := []byte(`
+services:
+  scratch:
+    build:
+     context: ./webapp
+    develop:
+      watch: 
+        - path: ./webapp/html
+          action: sync
+          target: /var/www
+          ignore:
+            - node_modules/
+`)
+
+	_, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
+	require.NoError(t, err)
+}
+
+func TestCgroup(t *testing.T) {
+	dt := []byte(`
+services:
+  scratch:
+    build:
+     context: ./webapp
+    cgroup: private
+`)
+
+	_, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
+	require.NoError(t, err)
+}
+
+func TestProjectName(t *testing.T) {
+	dt := []byte(`
+services:
+  scratch:
+    build:
+     context: ./webapp
+     args:
+       PROJECT_NAME: ${COMPOSE_PROJECT_NAME}
+`)
+
+	t.Run("default", func(t *testing.T) {
+		c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, nil)
+		require.NoError(t, err)
+		require.Len(t, c.Targets, 1)
+		require.Len(t, c.Targets[0].Args, 1)
+		require.Equal(t, map[string]*string{"PROJECT_NAME": ptrstr("bake")}, c.Targets[0].Args)
+	})
+
+	t.Run("env", func(t *testing.T) {
+		c, err := ParseCompose([]composetypes.ConfigFile{{Content: dt}}, map[string]string{"COMPOSE_PROJECT_NAME": "foo"})
+		require.NoError(t, err)
+		require.Len(t, c.Targets, 1)
+		require.Len(t, c.Targets[0].Args, 1)
+		require.Equal(t, map[string]*string{"PROJECT_NAME": ptrstr("foo")}, c.Targets[0].Args)
+	})
 }
 
 // chdir changes the current working directory to the named directory,

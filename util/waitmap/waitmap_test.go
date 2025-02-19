@@ -2,7 +2,6 @@ package waitmap
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -34,12 +33,12 @@ func TestTimeout(t *testing.T) {
 
 	m.Set("foo", "bar")
 
-	ctx, cancel := context.WithTimeout(context.TODO(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeoutCause(context.TODO(), 100*time.Millisecond, nil)
 	defer cancel()
 
 	_, err := m.Get(ctx, "bar")
 	require.Error(t, err)
-	require.True(t, errors.Is(err, context.DeadlineExceeded))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestBlocking(t *testing.T) {
