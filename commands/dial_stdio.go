@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"io"
 	"net"
 	"os"
@@ -15,7 +16,6 @@ import (
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
 )
 
 type stdioOptions struct {
@@ -79,27 +79,43 @@ func runDialStdio(dockerCli command.Cli, opts stdioOptions) error {
 			return err
 		}
 
-		defer conn.Close()
-
-		go func() {
-			<-ctx.Done()
-			closeWrite(conn)
-		}()
-
-		var eg errgroup.Group
-
-		eg.Go(func() error {
-			_, err := io.Copy(conn, os.Stdin)
-			closeWrite(conn)
-			return err
-		})
-		eg.Go(func() error {
-			_, err := io.Copy(os.Stdout, conn)
-			closeRead(conn)
-			return err
-		})
-		return eg.Wait()
+		return proxyConn(ctx, conn, os.Stdin, os.Stdout)
 	})
+}
+
+func proxyConn(ctx context.Context, conn net.Conn, stdin io.Reader, stdout io.Writer) error {
+	defer conn.Close()
+
+	stdinDone := make(chan error, 1)
+	stdoutDone := make(chan error, 1)
+
+	go func() {
+		_, err := io.Copy(conn, stdin)
+		closeWrite(conn)
+		stdinDone <- err
+	}()
+	go func() {
+		_, err := io.Copy(stdout, conn)
+		closeRead(conn)
+		stdoutDone <- err
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case err := <-stdinDone:
+			if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+				return err
+			}
+			stdinDone = nil
+		case err := <-stdoutDone:
+			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+				return err
+			}
+			return nil
+		}
+	}
 }
 
 func closeRead(conn net.Conn) error {
