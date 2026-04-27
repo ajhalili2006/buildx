@@ -41,8 +41,18 @@ func TestParse(t *testing.T) {
 			tag:  "latest",
 		},
 		{
+			s:    "oci-layout://a:1.3",
+			path: "a",
+			tag:  "1.3",
+		},
+		{
 			s:    `oci-layout://C:\path\to\oci\layout`,
 			path: `C:\path\to\oci\layout`,
+			tag:  "latest",
+		},
+		{
+			s:    `oci-layout://C:/path/to/oci/layout`,
+			path: `C:/path/to/oci/layout`,
 			tag:  "latest",
 		},
 		{
