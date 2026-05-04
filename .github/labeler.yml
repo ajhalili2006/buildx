@@ -103,6 +103,17 @@ area/history:
   - changed-files:
     - any-glob-to-any-file: 'commands/history/**'
 
+# Add 'area/policy' label to changes in policy files
+area/policy:
+  - changed-files:
+    - any-glob-to-any-file:
+      - build/policy*.go
+      - commands/policy/**
+      - docs/reference/buildx_policy*.md
+      - policy/**
+      - tests/policy*.go
+      - util/buildflags/policy*.go
+
 # Add 'area/tests' label to changes in test files
 area/tests:
   - changed-files:
