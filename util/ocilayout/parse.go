@@ -1,7 +1,6 @@
 package ocilayout
 
 import (
-	"regexp"
 	"strings"
 
 	"github.com/distribution/reference"
@@ -60,8 +59,13 @@ func (r Ref) String() string {
 	return s
 }
 
-var windowsDrivePath = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
-
 func isWindowsDrivePath(path string, colon int) bool {
-	return colon == 1 && windowsDrivePath.MatchString(path)
+	if colon != 1 || len(path) < 3 {
+		return false
+	}
+	if path[2] != '/' && path[2] != '\\' {
+		return false
+	}
+	c := path[0]
+	return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
 }

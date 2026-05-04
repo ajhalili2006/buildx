@@ -72,12 +72,14 @@ func TestParse(t *testing.T) {
 			dgst: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		},
 	} {
-		ref, ok, err := Parse(tt.s)
-		require.True(t, ok)
-		require.NoError(t, err)
-		assert.Equal(t, tt.path, ref.Path, "comparing path: %s", tt.s)
-		assert.Equal(t, tt.dgst, ref.Digest.String(), "comparing digest: %s", tt.s)
-		assert.Equal(t, tt.tag, ref.Tag, "comparing tag: %s", tt.s)
+		t.Run(tt.s, func(t *testing.T) {
+			ref, ok, err := Parse(tt.s)
+			require.True(t, ok)
+			require.NoError(t, err)
+			assert.Equal(t, tt.path, ref.Path, "comparing path: %s", tt.s)
+			assert.Equal(t, tt.dgst, ref.Digest.String(), "comparing digest: %s", tt.s)
+			assert.Equal(t, tt.tag, ref.Tag, "comparing tag: %s", tt.s)
+		})
 	}
 }
 
