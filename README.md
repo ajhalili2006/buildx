@@ -84,8 +84,8 @@ On Unix environments:
 
 On Windows:
 
-* `C:\ProgramData\Docker\cli-plugins`
 * `C:\Program Files\Docker\cli-plugins`
+* `C:\ProgramData\Docker\cli-plugins` (for docker 28.x and earlier only)
 
 > [!NOTE]
 > On Unix environments, it may also be necessary to make it executable with `chmod +x`:
