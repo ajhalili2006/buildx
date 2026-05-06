@@ -25,6 +25,7 @@ Build from a file
 | [`--load`](#load)                   | `bool`        |         | Shorthand for `--set=*.output=type=docker`. Conditional.                                                              |
 | [`--metadata-file`](#metadata-file) | `string`      |         | Write build result metadata to a file                                                                                 |
 | [`--no-cache`](#no-cache)           | `bool`        |         | Do not use cache when building the image                                                                              |
+| `--policy`                          | `stringArray` |         | Global policy evaluation options (format: `[disabled=true\|false][,strict=true\|false][,log-level=level]`)            |
 | [`--print`](#print)                 | `bool`        |         | Print the options without building                                                                                    |
 | [`--progress`](#progress)           | `string`      | `auto`  | Set type of progress output (`auto`, `none`,  `plain`, `quiet`, `rawjson`, `tty`). Use plain to show container output |
 | [`--provenance`](#provenance)       | `string`      |         | Shorthand for `--set=*.attest=type=provenance`                                                                        |

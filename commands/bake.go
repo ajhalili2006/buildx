@@ -57,6 +57,7 @@ type bakeOptions struct {
 
 	sbom       string
 	provenance string
+	policy     []string
 	allow      []string
 
 	builder      string
@@ -120,6 +121,14 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	if in.provenance != "" {
 		overrides = append(overrides, fmt.Sprintf("*.attest=%s", buildflags.CanonicalizeAttest("provenance", in.provenance)))
 	}
+
+	policyOverrides, disablePolicy, err := bakePolicyOverrides(in.policy)
+	if err != nil {
+		return err
+	} else if len(policyOverrides) > 0 {
+		overrides = append(overrides, policyOverrides...)
+	}
+
 	contextPathHash, _ := os.Getwd()
 
 	ent, err := bake.ParseEntitlements(in.allow)
@@ -240,6 +249,12 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	tgts, grps, err := bake.ReadTargets(ctx, files, targets, overrides, defaults, vars, &ent)
 	if err != nil {
 		return err
+	}
+	if disablePolicy {
+		policy := buildflags.PolicyConfigs{{Disabled: true}}
+		for _, t := range tgts {
+			t.Policy = slices.Clone(policy)
+		}
 	}
 
 	var sourceDateEpoch *string
@@ -526,6 +541,7 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 	flags.BoolVar(&options.exportPush, "push", false, `Shorthand for "--set=*.output=type=registry". Conditional.`)
 	flags.StringVar(&options.sbom, "sbom", "", `Shorthand for "--set=*.attest=type=sbom"`)
 	flags.StringVar(&options.provenance, "provenance", "", `Shorthand for "--set=*.attest=type=provenance"`)
+	flags.StringArrayVar(&options.policy, "policy", []string{}, `Global policy evaluation options (format: "[disabled=true|false][,strict=true|false][,log-level=level]")`)
 	flags.StringArrayVar(&options.overrides, "set", nil, `Override target value (e.g., "targetpattern.key=value")`)
 	flags.StringArrayVar(&options.vars, "var", nil, `Set a variable value (e.g., "name=value")`)
 	flags.StringVar(&options.callFunc, "call", "build", `Set method for evaluating build ("check", "outline", "targets")`)
@@ -548,6 +564,30 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 	commonBuildFlags(&cFlags, flags)
 
 	return cmd
+}
+
+func bakePolicyOverrides(in []string) ([]string, bool, error) {
+	configs, err := buildflags.ParsePolicyConfigs(in)
+	if err != nil {
+		return nil, false, err
+	}
+	overrides := make([]string, 0, len(in))
+	for i, cfg := range configs {
+		if len(cfg.Files) > 0 {
+			return nil, false, errors.New(`--policy does not accept filename; define policy files in the bake definition`)
+		}
+		if cfg.Reset {
+			return nil, false, errors.New(`--policy does not accept reset; define policy composition in the bake definition`)
+		}
+		if cfg.Disabled {
+			if cfg.Strict != nil || cfg.LogLevel != nil || len(configs) > 1 {
+				return nil, false, errors.New("disabled policy cannot be combined with other policy flags")
+			}
+			return nil, true, nil
+		}
+		overrides = append(overrides, "*.policy+="+in[i])
+	}
+	return overrides, false, nil
 }
 
 func bakeEnvFiles(lookup func(string string) (string, bool)) ([]string, error) {

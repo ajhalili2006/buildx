@@ -126,6 +126,7 @@ target "disabled-combined" {
 	cases := []struct {
 		name            string
 		target          string
+		policyArgs      []string
 		wantErrContains string
 	}{
 		{
@@ -160,15 +161,42 @@ target "disabled-combined" {
 			target:          "disabled-combined",
 			wantErrContains: "disabled policy cannot be combined with other policy flags",
 		},
+		{
+			name:       "global-disabled-skips-target-policies",
+			target:     "fail-extra",
+			policyArgs: []string{"--policy", "disabled=true"},
+		},
+		{
+			name:            "global-policy-rejects-filename",
+			target:          "pass-both",
+			policyArgs:      []string{"--policy", "filename=extra.rego"},
+			wantErrContains: "--policy does not accept filename",
+		},
+		{
+			name:            "global-policy-rejects-reset",
+			target:          "pass-both",
+			policyArgs:      []string{"--policy", "reset=true"},
+			wantErrContains: "--policy does not accept reset",
+		},
+		{
+			name:            "global-disabled-cannot-combine",
+			target:          "pass-both",
+			policyArgs:      []string{"--policy", "disabled=true,strict=true"},
+			wantErrContains: "disabled policy cannot be combined with other policy flags",
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cmd := buildxCmd(sb, withDir(dir), withArgs(
+			args := []string{
 				"bake",
 				"--progress=plain",
 				"--file", "docker-bake.hcl",
-				tc.target,
+			}
+			args = append(args, tc.policyArgs...)
+			args = append(args, tc.target)
+			cmd := buildxCmd(sb, withDir(dir), withArgs(
+				args...,
 			))
 			out, err := cmd.CombinedOutput()
 			if tc.wantErrContains == "" {
