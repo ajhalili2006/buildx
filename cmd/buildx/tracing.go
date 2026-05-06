@@ -4,7 +4,7 @@ import (
 	"github.com/moby/buildkit/util/tracing/detect"
 	"go.opentelemetry.io/otel"
 
-	_ "github.com/moby/buildkit/util/tracing/env"
+	_ "github.com/moby/buildkit/util/tracing/childprocess"
 )
 
 func init() {

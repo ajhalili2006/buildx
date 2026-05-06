@@ -84,7 +84,7 @@ func BuildName(fattrs map[string]string, ls *localstate.State) string {
 		}
 	}
 	if res == "" && vcsSource != "" {
-		u, _ := dfgitutil.FragmentFormat(vcsSource)
+		u, _ := dfgitutil.FragmentFormat(vcsSource, false)
 		return u
 	}
 	return res
