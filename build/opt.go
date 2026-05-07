@@ -188,6 +188,9 @@ func (l *policyProgressLogger) Close(err error) {
 		shouldComplete = true
 		started = l.started
 		l.open = false
+	} else if err != nil && !l.started.IsZero() {
+		shouldComplete = true
+		started = l.started
 	}
 	l.window++
 	if l.timer != nil {
