@@ -108,7 +108,6 @@ func proxyConn(ctx context.Context, conn net.Conn, stdin io.Reader, stdout io.Wr
 			if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 				return err
 			}
-			stdinDone = nil
 		case err := <-stdoutDone:
 			if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 				return err
