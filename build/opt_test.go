@@ -2,6 +2,7 @@ package build
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/docker/buildx/util/buildflags"
@@ -11,6 +12,7 @@ import (
 	"github.com/moby/buildkit/client/ociindex"
 	"github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -237,6 +239,30 @@ func TestLoadInputsOCILayoutNamedContext(t *testing.T) {
 	}
 }
 
+func TestPolicyProgressLoggerCloseWithErrorAfterCompletedWindow(t *testing.T) {
+	pw := &captureProgressWriter{}
+	logger := newPolicyProgressLogger(pw, "loading policies policy.rego")
+
+	logger.Log("policy decision: DENY")
+	logger.completeWindow(1, nil)
+	logger.Close(errors.New("source not allowed by policy"))
+
+	var completedErrors []string
+	for _, st := range pw.Statuses() {
+		for _, v := range st.Vertexes {
+			if v == nil || v.Completed == nil {
+				continue
+			}
+			if v.Error == "" {
+				continue
+			}
+			completedErrors = append(completedErrors, v.Error)
+		}
+	}
+
+	require.Equal(t, []string{"source not allowed by policy"}, completedErrors)
+}
+
 type testProgressWriter struct{}
 
 func (testProgressWriter) Write(*client.SolveStatus) {}
@@ -248,3 +274,28 @@ func (testProgressWriter) ValidateLogSource(digest.Digest, any) bool { return tr
 func (testProgressWriter) ClearLogSource(any) {}
 
 var _ progress.Writer = testProgressWriter{}
+
+type captureProgressWriter struct {
+	mu       sync.Mutex
+	statuses []*client.SolveStatus
+}
+
+func (w *captureProgressWriter) Write(st *client.SolveStatus) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.statuses = append(w.statuses, st)
+}
+
+func (w *captureProgressWriter) Statuses() []*client.SolveStatus {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]*client.SolveStatus(nil), w.statuses...)
+}
+
+func (w *captureProgressWriter) WriteBuildRef(string, string) {}
+
+func (w *captureProgressWriter) ValidateLogSource(digest.Digest, any) bool { return true }
+
+func (w *captureProgressWriter) ClearLogSource(any) {}
+
+var _ progress.Writer = (*captureProgressWriter)(nil)
