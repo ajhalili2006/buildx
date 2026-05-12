@@ -80,6 +80,7 @@ jobs:
           push-to-fork: docker-tools-robot/docker.github.io
           commit-message: "vendor: github.com/docker/buildx ${{ env.RELEASE_NAME }}"
           signoff: true
+          sign-commits: true
           branch: dispatch/buildx-ref-${{ env.RELEASE_NAME }}
           delete-branch: true
           title: Update buildx reference to ${{ env.RELEASE_NAME }}
