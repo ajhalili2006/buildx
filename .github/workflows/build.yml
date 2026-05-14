@@ -47,9 +47,9 @@ jobs:
           - master
           - latest
           - buildx-stable-1
+          - v0.29.0
           - v0.28.1
           - v0.27.1
-          - v0.26.3
         worker:
           - docker-container
           - remote
